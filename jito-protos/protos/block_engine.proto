@@ -3,6 +3,7 @@ syntax = "proto3";
 import "packet.proto";
 import "shared.proto";
 import "bundle.proto";
+import "sanitized.proto";
 
 package block_engine;
 
@@ -52,21 +53,8 @@ message ExpiringPacketBatch {
 
 message ExpiringSanitizedTransactionBatch {
   shared.Header header = 1;
-  SanitizedTransactionBatch batch = 2;
+  sanitized.SanitizedTransactionBatch batch = 2;
   uint32 expiry_ms = 3;
-}
-
-message SanitizedTransactionBatch {
-  repeated SanitizedTransaction transactions = 1;
-}
-
-message SanitizedTransaction {
-  // bincode serialized versioned_transaction
-  bytes versioned_transaction = 1;
-  bytes message_hash = 2;
-  // is_simple_vote_tx always == false
-  // bincode serialized LoadedAddress
-  bytes loaded_addresses = 3;
 }
 
 

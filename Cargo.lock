@@ -2520,6 +2520,7 @@ dependencies = [
 name = "jito-protos"
 version = "0.1.8"
 dependencies = [
+ "bincode",
  "bytes",
  "prost 0.12.3",
  "prost-types 0.12.3",
