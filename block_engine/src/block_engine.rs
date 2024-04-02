@@ -19,12 +19,13 @@ use jito_protos::{
         Token,
     },
     block_engine::{
-        block_engine_relayer_client::BlockEngineRelayerClient, packet_batch_update::Msg,
-        AccountsOfInterestRequest, AccountsOfInterestUpdate, ExpiringPacketBatch,
-        PacketBatchUpdate, ProgramsOfInterestRequest, ProgramsOfInterestUpdate,
+        block_engine_relayer_client::BlockEngineRelayerClient,
+        sanitized_transaction_batch_update::Msg, AccountsOfInterestRequest,
+        AccountsOfInterestUpdate, ExpiringSanitizedTransactionBatch, ProgramsOfInterestRequest,
+        ProgramsOfInterestUpdate, SanitizedTransactionBatchUpdate,
     },
-    convert::packet_to_proto_packet,
-    packet::PacketBatch as ProtoPacketBatch,
+    convert::sanitized_to_proto_sanitized,
+    sanitized::SanitizedTransactionBatch,
     shared::{Header, Heartbeat},
 };
 use log::{error, *};
@@ -32,8 +33,15 @@ use prost_types::Timestamp;
 use solana_core::banking_trace::BankingPacketBatch;
 use solana_metrics::{datapoint_error, datapoint_info};
 use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey, signature::Signer,
-    signer::keypair::Keypair, transaction::VersionedTransaction,
+    address_lookup_table::AddressLookupTableAccount,
+    message::{
+        v0::{LoadedAddresses, MessageAddressTableLookup},
+        AddressLoader, AddressLoaderError,
+    },
+    pubkey::Pubkey,
+    signature::Signer,
+    signer::keypair::Keypair,
+    transaction::{MessageHash, SanitizedTransaction, TransactionError, VersionedTransaction},
 };
 use thiserror::Error;
 use tokio::{
@@ -328,7 +336,9 @@ impl BlockEngineRelayerHandler {
         let (block_engine_packet_sender, block_engine_packet_receiver) =
             channel(Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY);
         let _response = client
-            .start_expiring_packet_stream(ReceiverStream::new(block_engine_packet_receiver))
+            .start_expiring_sanitized_transaction_stream(ReceiverStream::new(
+                block_engine_packet_receiver,
+            ))
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
@@ -352,7 +362,7 @@ impl BlockEngineRelayerHandler {
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_packet_stream(
-        block_engine_packet_sender: Sender<PacketBatchUpdate>,
+        block_engine_packet_sender: Sender<SanitizedTransactionBatchUpdate>,
         block_engine_receiver: &mut Receiver<BlockEnginePackets>,
         subscribe_aoi_stream: Response<Streaming<AccountsOfInterestUpdate>>,
         subscribe_poi_stream: Response<Streaming<ProgramsOfInterestUpdate>>,
@@ -434,12 +444,12 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.0.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
+                    let filtered_transactions = Self::filter_and_sanitize(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
-                    if let Some(filtered_packets) = filtered_packets {
+                    if let Some(filtered_transactions) = filtered_transactions {
                         let now = Instant::now();
-                        let packet_forward_count = Self::forward_packets(&block_engine_packet_sender, filtered_packets).await?;
+                        let packet_forward_count = Self::forward_sanitized_transactions(&block_engine_packet_sender, filtered_transactions).await?;
                         block_engine_stats.increment_packet_forward_count(packet_forward_count as u64);
                         block_engine_stats.increment_packet_forward_elapsed_us(now.elapsed().as_micros() as u64);
                     }
@@ -608,15 +618,15 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Forwards packets to the Block Engine
-    async fn forward_packets(
-        block_engine_packet_sender: &Sender<PacketBatchUpdate>,
-        batch: ExpiringPacketBatch,
+    /// Forwards sanitized transactions to the Block Engine
+    async fn forward_sanitized_transactions(
+        block_engine_packet_sender: &Sender<SanitizedTransactionBatchUpdate>,
+        batch: ExpiringSanitizedTransactionBatch,
     ) -> BlockEngineResult<usize> {
-        let num_packets = batch.batch.as_ref().unwrap().packets.len();
+        let num_packets = batch.batch.as_ref().unwrap().transactions.len();
 
         if let Err(e) = block_engine_packet_sender
-            .send(PacketBatchUpdate {
+            .send(SanitizedTransactionBatchUpdate {
                 msg: Some(Msg::Batches(batch)),
             })
             .await
@@ -630,16 +640,17 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Filters out packets that aren't on list of interest
-    fn filter_packets(
+    /// Filter out packets that aren't on list of interest
+    /// and sanitize the transactions (resolve address lookups)
+    fn filter_and_sanitize(
         block_engine_batches: BlockEnginePackets,
         num_packets: u64,
         accounts_of_interest: &mut TimedCache<Pubkey, u8>,
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
         address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
-    ) -> Option<ExpiringPacketBatch> {
-        let mut filtered_packets = Vec::with_capacity(num_packets as usize);
+    ) -> Option<ExpiringSanitizedTransactionBatch> {
+        let mut filtered_transactions = Vec::with_capacity(num_packets as usize);
 
         for batch in &block_engine_batches.banking_packet_batch.0 {
             for packet in batch {
@@ -671,21 +682,25 @@ impl BlockEngineRelayerHandler {
                     };
 
                     if is_forwardable {
-                        if let Some(packet) = packet_to_proto_packet(packet) {
-                            filtered_packets.push(packet)
+                        if let Some(transaction) =
+                            sanitize_transaction(tx, address_lookup_table_cache)
+                                .ok()
+                                .and_then(sanitized_to_proto_sanitized)
+                        {
+                            filtered_transactions.push(transaction);
                         }
                     }
                 }
             }
         }
 
-        if !filtered_packets.is_empty() {
-            Some(ExpiringPacketBatch {
+        if !filtered_transactions.is_empty() {
+            Some(ExpiringSanitizedTransactionBatch {
                 header: Some(Header {
                     ts: Some(Timestamp::from(block_engine_batches.stamp)),
                 }),
-                batch: Some(ProtoPacketBatch {
-                    packets: filtered_packets,
+                batch: Some(SanitizedTransactionBatch {
+                    transactions: filtered_transactions,
                 }),
                 expiry_ms: block_engine_batches.expiration,
             })
@@ -697,11 +712,11 @@ impl BlockEngineRelayerHandler {
     /// Checks the heartbeat timeout and errors out if the heartbeat didn't come in time.
     /// Assuming that's okay, sends a heartbeat back and if that fails, disconnect.
     async fn check_and_send_heartbeat(
-        block_engine_packet_sender: &Sender<PacketBatchUpdate>,
+        block_engine_packet_sender: &Sender<SanitizedTransactionBatchUpdate>,
         heartbeat_count: &u64,
     ) -> BlockEngineResult<()> {
         if let Err(e) = block_engine_packet_sender
-            .send(PacketBatchUpdate {
+            .send(SanitizedTransactionBatchUpdate {
                 msg: Some(Msg::Heartbeat(Heartbeat {
                     count: *heartbeat_count,
                 })),
@@ -770,4 +785,58 @@ fn is_aoi_in_lookup_table(
         }
     }
     false
+}
+
+fn sanitize_transaction(
+    tx: VersionedTransaction,
+    address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
+) -> Result<SanitizedTransaction, TransactionError> {
+    SanitizedTransaction::try_create(
+        tx,
+        MessageHash::Compute,
+        None,
+        AltCache(address_lookup_table_cache),
+    )
+}
+
+#[derive(Clone)]
+struct AltCache<'a>(&'a DashMap<Pubkey, AddressLookupTableAccount>);
+impl AddressLoader for AltCache<'_> {
+    fn load_addresses(
+        self,
+        lookups: &[MessageAddressTableLookup],
+    ) -> Result<LoadedAddresses, AddressLoaderError> {
+        lookups
+            .iter()
+            .map(|lookup| {
+                let account = self
+                    .0
+                    .get(&lookup.account_key)
+                    .ok_or(AddressLoaderError::LookupTableAccountNotFound)?;
+                let writable = lookup
+                    .writable_indexes
+                    .iter()
+                    .map(|&index| {
+                        account
+                            .addresses
+                            .get(index as usize)
+                            .copied()
+                            .ok_or(AddressLoaderError::InvalidLookupIndex)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let readonly = lookup
+                    .readonly_indexes
+                    .iter()
+                    .map(|&index| {
+                        account
+                            .addresses
+                            .get(index as usize)
+                            .copied()
+                            .ok_or(AddressLoaderError::InvalidLookupIndex)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(LoadedAddresses { writable, readonly })
+            })
+            .collect()
+    }
 }

@@ -18,6 +18,7 @@ fn main() {
                 "protos/relayer.proto",
                 "protos/searcher.proto",
                 "protos/shared.proto",
+                "protos/sanitized.proto",
             ],
             &["protos"],
         )
