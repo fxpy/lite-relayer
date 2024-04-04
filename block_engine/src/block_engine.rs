@@ -244,10 +244,15 @@ impl BlockEngineRelayerHandler {
                 .tls_config(tonic::transport::ClientTlsConfig::new())
                 .expect("invalid tls config");
         }
+
+        info!("start auth");
+
         let channel = auth_endpoint
             .connect()
             .await
             .map_err(|e| BlockEngineError::AuthServiceFailure(e.to_string()))?;
+
+        info!("error open channel auth");
         let mut auth_client = AuthServiceClient::new(channel);
 
         let (access_token, mut refresh_token) = Self::auth(&mut auth_client, keypair).await?;
