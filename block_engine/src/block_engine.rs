@@ -186,6 +186,8 @@ impl BlockEngineRelayerHandler {
             .await
             .map_err(|e| BlockEngineError::AuthServiceFailure(e.to_string()))?;
 
+        info!("auth_response success");
+
         let challenge = format!(
             "{}-{}",
             keypair.pubkey(),
