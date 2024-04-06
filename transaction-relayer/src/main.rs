@@ -34,7 +34,7 @@ use jito_relayer::{
 };
 use jito_relayer_web::{start_relayer_web_server, RelayerState};
 use jito_rpc::load_balancer::LoadBalancer;
-use jito_transaction_relayer::forwarder::start_forward_and_delay_thread;
+use transaction_relayer::forwarder::start_forward_and_delay_thread;
 use jwt::{AlgorithmType, PKeyWithDigest};
 use log::{debug, error, info, warn};
 use openssl::{hash::MessageDigest, pkey::PKey};
@@ -359,7 +359,7 @@ fn main() {
     // tracked as forwarder_metrics.block_engine_sender_len
     // TODO block engine -> pbs stage
     let (block_engine_sender, block_engine_receiver) =
-        channel(jito_transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
+        channel(transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
 
     let forward_and_delay_threads = start_forward_and_delay_thread(
         verified_receiver,
