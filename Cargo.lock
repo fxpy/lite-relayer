@@ -2589,41 +2589,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "jito-transaction-relayer"
-version = "0.1.8"
-dependencies = [
- "bincode",
- "clap 4.4.8",
- "crossbeam-channel",
- "dashmap 5.5.3",
- "env_logger",
- "hostname",
- "itertools 0.10.5",
- "jito-block-engine",
- "jito-core",
- "jito-protos",
- "jito-relayer",
- "jito-relayer-web",
- "jito-rpc",
- "jwt",
- "log",
- "openssl",
- "prost-types 0.12.3",
- "solana-address-lookup-table-program",
- "solana-client",
- "solana-core",
- "solana-metrics",
- "solana-net-utils",
- "solana-perf",
- "solana-program",
- "solana-sdk",
- "tikv-jemallocator",
- "tokio",
- "tokio-stream",
- "tonic 0.10.2",
-]
-
-[[package]]
 name = "jobserver"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7104,6 +7069,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c06d3da6113f116aaee68e4d601191614c9053067f9ab7f6edbcb161237daa54"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "transaction-relayer"
+version = "0.1.8"
+dependencies = [
+ "bincode",
+ "clap 4.4.8",
+ "crossbeam-channel",
+ "dashmap 5.5.3",
+ "env_logger",
+ "hostname",
+ "itertools 0.10.5",
+ "jito-block-engine",
+ "jito-core",
+ "jito-protos",
+ "jito-relayer",
+ "jito-relayer-web",
+ "jito-rpc",
+ "jwt",
+ "log",
+ "openssl",
+ "prost-types 0.12.3",
+ "solana-address-lookup-table-program",
+ "solana-client",
+ "solana-core",
+ "solana-metrics",
+ "solana-net-utils",
+ "solana-perf",
+ "solana-program",
+ "solana-sdk",
+ "tikv-jemallocator",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.10.2",
 ]
 
 [[package]]

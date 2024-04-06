@@ -1,1 +1,1 @@
-./target/release/jito-transaction-relayer --keypair-path ./keypair.json --signing-key-pem-path ./auth --verifying-key-pem-path ./auth.pub  --rpc-servers http://denis.helius-rpc.com
+./target/release/jito-transaction-relayer --keypair-path /root/config/relayer.json --signing-key-pem-path /root/config/auth --verifying-key-pem-path /root/config/auth.pub --packet-delay-ms 350 --webserver-bind-addr 127.0.0.1:5050 --block-engine-url http://127.0.0.1:11227

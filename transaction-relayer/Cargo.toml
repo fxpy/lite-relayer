@@ -1,6 +1,6 @@
 [package]
-name = "jito-transaction-relayer"
-description = "Jito relayer entrypoint"
+name = "transaction-relayer"
+description = "Relayer entrypoint"
 version = { workspace = true }
 authors = { workspace = true }
 homepage = { workspace = true }

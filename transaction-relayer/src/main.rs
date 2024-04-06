@@ -186,7 +186,7 @@ struct Args {
     ofac_addresses: Option<Vec<Pubkey>>,
 
     /// Webserver bind address that exposes diagnostic information
-    #[arg(long, env, default_value_t = SocketAddr::from_str("127.0.0.1:11227").unwrap())]
+    #[arg(long, env, default_value_t = SocketAddr::from_str("127.0.0.1:5050").unwrap())]
     webserver_bind_addr: SocketAddr,
 
     /// Max unstaked connections for the QUIC server
