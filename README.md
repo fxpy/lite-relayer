@@ -19,12 +19,15 @@ USA East:      http://miami.solanaforge.xyz
 EU Amsterdam:  http://ams.solanaforge.xyz
 ```
 
-3. ./target/release/transaction-relayer --keypair-path /root/config/relayer.json \
+3. Run
+```
+./target/release/transaction-relayer --keypair-path /root/config/relayer.json \
 --signing-key-pem-path /root/config/auth \
 --verifying-key-pem-path /root/config/auth.pub \
 --webserver-bind-addr 127.0.0.1:5050 \
 --block-engine-url http://ОДИН_ИЗ_СЕРВЕРОВ_ИЗ_СПИСКА_2:11227 \
 --block-engine-auth-service-url http://ОДИН_ИЗ_СЕРВЕРОВ_ИЗ_СПИСКА_2:11227
+```
 
 4. Pay attention to the keys --signing-key-pem-path, --verifying-key-pem-path, --keypair-path you must generate them yourself!!!
 
