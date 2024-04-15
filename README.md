@@ -5,7 +5,7 @@ Forge Relayer acts as a transaction processing unit (TPU) proxy for Solana valid
 ```shell
 #git clone relayer
 $ git submodule update -i -r
-$ cargo buill -r --bin transaction-relayer
+$ cargo build -r --bin transaction-relayer
 ```
 
 # Running 
