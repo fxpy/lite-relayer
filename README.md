@@ -3,15 +3,13 @@ Forge Relayer acts as a transaction processing unit (TPU) proxy for Solana valid
 
 # Building
 ```shell
-# pull submodules to get protobuffers required to connect to Block Engine and validator
+#git clone relayer
 $ git submodule update -i -r
-# build from source
-$ cargo b --release
+$ cargo buill -r --bin transaction-relayer
 ```
 
 # Running 
-1. cargo buill -r --bin transaction-relayer
-2.  Choose one server from this list:
+1.  Choose one server from this list:
 ```
 Asia Tokyo:    http://tokyo.solanaforge.xyz
 USA West:      http://la.solanaforge.xyz
@@ -19,7 +17,7 @@ USA East:      http://miami.solanaforge.xyz
 EU Amsterdam:  http://ams.solanaforge.xyz
 ```
 
-3. Run
+2. Run
 ```
 ./target/release/transaction-relayer --keypair-path /root/config/relayer.json \
 --signing-key-pem-path /root/config/auth \
