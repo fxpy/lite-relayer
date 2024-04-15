@@ -12,10 +12,12 @@ $ cargo b --release
 # Running 
 1. cargo buill -r --bin transaction-relayer
 2.  Choose one server from this list:
+```
 Asia Tokyo:    http://tokyo.solanaforge.xyz
 USA West:      http://la.solanaforge.xyz
 USA East:      http://miami.solanaforge.xyz
 EU Amsterdam:  http://ams.solanaforge.xyz
+```
 
 3. ./target/release/transaction-relayer --keypair-path /root/config/relayer.json \
 --signing-key-pem-path /root/config/auth \
