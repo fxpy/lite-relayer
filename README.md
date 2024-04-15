@@ -1,5 +1,5 @@
-# Jito Relayer
-Jito Relayer acts as a transaction processing unit (TPU) proxy for Solana validators.
+# Forge Relayer
+Forge Relayer acts as a transaction processing unit (TPU) proxy for Solana validators.
 
 # Building
 ```shell
@@ -31,3 +31,6 @@ There are two options for running the relayer from releases:
 
 # Running a Relayer
 See https://jito-foundation.gitbook.io/mev/jito-relayer/running-a-relayer for setup and usage instructions.
+
+** add Sanitize Transaction
+
