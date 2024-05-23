@@ -19,30 +19,37 @@ use jito_protos::{
         Token,
     },
     block_engine::{
-        block_engine_relayer_client::BlockEngineRelayerClient, packet_batch_update::Msg,
-        AccountsOfInterestRequest, AccountsOfInterestUpdate, ExpiringPacketBatch,
-        PacketBatchUpdate, ProgramsOfInterestRequest, ProgramsOfInterestUpdate,
+        block_engine_relayer_client::BlockEngineRelayerClient,
+        sanitized_transaction_batch_update::Msg, AccountsOfInterestRequest,
+        AccountsOfInterestUpdate, ExpiringSanitizedTransactionBatch, ProgramsOfInterestRequest,
+        ProgramsOfInterestUpdate, SanitizedTransactionBatchUpdate,
     },
-    convert::packet_to_proto_packet,
-    packet::PacketBatch as ProtoPacketBatch,
+    convert::sanitized_to_proto_sanitized,
+    sanitized::SanitizedTransactionBatch,
     shared::{Header, Heartbeat},
 };
 use log::{error, *};
 use prost_types::Timestamp;
-use rand::Rng;
-use solana_core::banking_trace::BankingPacketBatch;
 use solana_metrics::{datapoint_error, datapoint_info};
 use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey, signature::Signer,
-    signer::keypair::Keypair, transaction::VersionedTransaction,
+    address_lookup_table::AddressLookupTableAccount,
+    message::{
+        v0::{LoadedAddresses, MessageAddressTableLookup},
+        AddressLoader, AddressLoaderError,
+    },
+    pubkey::Pubkey,
+    signature::Signer,
+    signer::keypair::Keypair,
+    transaction::{MessageHash, SanitizedTransaction, TransactionError, VersionedTransaction},
 };
 use thiserror::Error;
 use tokio::{
     runtime::Runtime,
     select,
-    sync::{broadcast::Receiver, mpsc::channel as mpsc_channel, mpsc::Sender},
+    sync::mpsc::{channel, Sender},
     time::{interval, sleep},
 };
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
     codegen::InterceptedService,
@@ -50,6 +57,8 @@ use tonic::{
     transport::{Channel, Endpoint},
     Response, Status, Streaming,
 };
+use jito_block_engine::block_engine::BlockEnginePackets;
+use jito_protos::block_engine::ConnectedValidatorsUpdate;
 
 use crate::block_engine_stats::BlockEngineStats;
 
@@ -81,13 +90,6 @@ impl Interceptor for AuthInterceptor {
     }
 }
 
-#[derive(Clone)]
-pub struct BlockEnginePackets {
-    pub banking_packet_batch: BankingPacketBatch,
-    pub stamp: SystemTime,
-    pub expiration: u32,
-}
-
 #[derive(Error, Debug)]
 pub enum BlockEngineError {
     #[error("auth service failed: {0}")]
@@ -107,10 +109,13 @@ pub struct BlockEngineRelayerHandler {
 impl BlockEngineRelayerHandler {
     const BLOCK_ENGINE_PACKET_QUEUE_CAPACITY: usize = 1_000;
 
+    const BLOCK_ENGINE_CONNECTED_VALIDATORS_QUEUE_CAPACITY: usize = 100;
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         block_engine_config: Option<BlockEngineConfig>,
-        mut block_engine_receiver: Receiver<BlockEnginePackets>,
+        mut block_engine_receiver: broadcast::Receiver<BlockEnginePackets>,
+        mut connected_validators_watch: watch::Receiver<HashSet<Pubkey>>,
         keypair: Arc<Keypair>,
         exit: Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
@@ -130,6 +135,7 @@ impl BlockEngineRelayerHandler {
                                 &config.block_engine_url,
                                 &config.auth_service_url,
                                 &mut block_engine_receiver,
+                                &mut connected_validators_watch,
                                 &keypair,
                                 &exit,
                                 aoi_cache_ttl_s,
@@ -180,6 +186,8 @@ impl BlockEngineRelayerHandler {
             .await
             .map_err(|e| BlockEngineError::AuthServiceFailure(e.to_string()))?;
 
+        info!("auth_response success");
+
         let challenge = format!(
             "{}-{}",
             keypair.pubkey(),
@@ -222,7 +230,8 @@ impl BlockEngineRelayerHandler {
     async fn auth_and_connect(
         block_engine_url: &str,
         auth_service_url: &str,
-        block_engine_receiver: &mut Receiver<BlockEnginePackets>,
+        block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
+        connected_validators_watch: &mut watch::Receiver<HashSet<Pubkey>>,
         keypair: &Arc<Keypair>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
@@ -236,10 +245,12 @@ impl BlockEngineRelayerHandler {
                 .tls_config(tonic::transport::ClientTlsConfig::new())
                 .expect("invalid tls config");
         }
+
         let channel = auth_endpoint
             .connect()
             .await
             .map_err(|e| BlockEngineError::AuthServiceFailure(e.to_string()))?;
+        
         let mut auth_client = AuthServiceClient::new(channel);
 
         let (access_token, mut refresh_token) = Self::auth(&mut auth_client, keypair).await?;
@@ -274,7 +285,7 @@ impl BlockEngineRelayerHandler {
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
-        datapoint_info!("block_engine-connection_stats",
+        datapoint_info!("forge_block_engine-connection_stats",
             "block_engine_url" => block_engine_url,
             "auth_service_url" => auth_service_url,
             ("connected", 1, i64)
@@ -286,6 +297,7 @@ impl BlockEngineRelayerHandler {
             block_engine_client,
             block_engine_receiver,
             auth_client,
+            connected_validators_watch,
             keypair,
             &mut refresh_token,
             shared_access_token,
@@ -306,8 +318,9 @@ impl BlockEngineRelayerHandler {
     #[allow(clippy::too_many_arguments)]
     async fn start_event_loop(
         mut client: BlockEngineRelayerClient<InterceptedService<Channel, AuthInterceptor>>,
-        block_engine_receiver: &mut Receiver<BlockEnginePackets>,
+        block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
         auth_client: AuthServiceClient<Channel>,
+        connected_validators_watch: &mut watch::Receiver<HashSet<Pubkey>>,
         keypair: &Arc<Keypair>,
         refresh_token: &mut Token,
         shared_access_token: Arc<Mutex<Token>>,
@@ -326,17 +339,29 @@ impl BlockEngineRelayerHandler {
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
+        let (connected_validators_sender, connected_validators_receiver) = mpsc::channel(
+            Self::BLOCK_ENGINE_CONNECTED_VALIDATORS_QUEUE_CAPACITY,
+        );
+        let _response = client
+            .connected_validators_stream(ReceiverStream::new(connected_validators_receiver))
+            .await
+            .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
+
         // sender tracked as block_engine_relayer-loop_stats.block_engine_packet_sender_len
         let (block_engine_packet_sender, block_engine_packet_receiver) =
-            mpsc_channel(Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY);
+            channel(Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY);
         let _response = client
-            .start_expiring_packet_stream(ReceiverStream::new(block_engine_packet_receiver))
+            .start_expiring_sanitized_transaction_stream(ReceiverStream::new(
+                block_engine_packet_receiver,
+            ))
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
         Self::handle_packet_stream(
             block_engine_packet_sender,
             block_engine_receiver,
+            connected_validators_sender,
+            connected_validators_watch,
             subscribe_aoi_stream,
             subscribe_poi_stream,
             auth_client,
@@ -354,8 +379,10 @@ impl BlockEngineRelayerHandler {
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_packet_stream(
-        block_engine_packet_sender: Sender<PacketBatchUpdate>,
-        block_engine_receiver: &mut Receiver<BlockEnginePackets>,
+        block_engine_packet_sender: Sender<SanitizedTransactionBatchUpdate>,
+        block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
+        connected_validators_sender: Sender<ConnectedValidatorsUpdate>,
+        connected_validators_watch: &mut watch::Receiver<HashSet<Pubkey>>,
         subscribe_aoi_stream: Response<Streaming<AccountsOfInterestUpdate>>,
         subscribe_poi_stream: Response<Streaming<ProgramsOfInterestUpdate>>,
         mut auth_client: AuthServiceClient<Channel>,
@@ -427,7 +454,8 @@ impl BlockEngineRelayerHandler {
                 }
                 block_engine_batches = block_engine_receiver.recv() => {
                     trace!("received block engine batches");
-                    let block_engine_batches = block_engine_batches.map_err(|_| BlockEngineError::BlockEngineFailure("block engine packet receiver disconnected".to_string()))?;
+                    let block_engine_batches = block_engine_batches
+                        .map_err(|_| BlockEngineError::BlockEngineFailure("block engine packet receiver disconnected".to_string()))?;
 
                     let now = Instant::now();
 
@@ -435,16 +463,23 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.0.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
+                    let filtered_transactions = Self::filter_and_sanitize(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
-                    if let Some(filtered_packets) = filtered_packets {
+                    if let Some(filtered_transactions) = filtered_transactions {
                         let now = Instant::now();
-                        let packet_forward_count = Self::forward_packets(&block_engine_packet_sender, filtered_packets).await?;
+                        let packet_forward_count = Self::forward_sanitized_transactions(&block_engine_packet_sender, filtered_transactions).await?;
                         block_engine_stats.increment_packet_forward_count(packet_forward_count as u64);
                         block_engine_stats.increment_packet_forward_elapsed_us(now.elapsed().as_micros() as u64);
                     }
-
+                }
+                maybe_changed = connected_validators_watch.changed() => {
+                    if let Ok(_) = maybe_changed {
+                        let validators = connected_validators_watch.borrow_and_update();
+                        let _ = connected_validators_sender.try_send(ConnectedValidatorsUpdate {
+                            validators: validators.iter().map(|v| v.to_bytes().into()).collect()
+                        });
+                    }
                 }
                 _ = auth_refresh_interval.tick() => {
                     trace!("refreshing auth interval");
@@ -474,13 +509,9 @@ impl BlockEngineRelayerHandler {
                 }
             }
 
-            // random capacity between 0 and 1000
-            // 0 is the minimum capacity
-
-            let capacity = rand::thread_rng().gen_range(0..1000);
-
             block_engine_stats.update_block_engine_packet_sender_len(
-                (Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY - capacity) as u64,
+                (Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY - block_engine_packet_sender.capacity())
+                    as u64,
             );
         }
         Ok(())
@@ -614,15 +645,15 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Forwards packets to the Block Engine
-    async fn forward_packets(
-        block_engine_packet_sender: &Sender<PacketBatchUpdate>,
-        batch: ExpiringPacketBatch,
+    /// Forwards sanitized transactions to the Block Engine
+    async fn forward_sanitized_transactions(
+        block_engine_packet_sender: &Sender<SanitizedTransactionBatchUpdate>,
+        batch: ExpiringSanitizedTransactionBatch,
     ) -> BlockEngineResult<usize> {
-        let num_packets = batch.batch.as_ref().unwrap().packets.len();
+        let num_packets = batch.batch.as_ref().unwrap().transactions.len();
 
         if let Err(e) = block_engine_packet_sender
-            .send(PacketBatchUpdate {
+            .send(SanitizedTransactionBatchUpdate {
                 msg: Some(Msg::Batches(batch)),
             })
             .await
@@ -636,16 +667,17 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Filters out packets that aren't on list of interest
-    fn filter_packets(
+    /// Filter out packets that aren't on list of interest
+    /// and sanitize the transactions (resolve address lookups)
+    fn filter_and_sanitize(
         block_engine_batches: BlockEnginePackets,
         num_packets: u64,
         accounts_of_interest: &mut TimedCache<Pubkey, u8>,
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
         address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
-    ) -> Option<ExpiringPacketBatch> {
-        let mut filtered_packets = Vec::with_capacity(num_packets as usize);
+    ) -> Option<ExpiringSanitizedTransactionBatch> {
+        let mut filtered_transactions = Vec::with_capacity(num_packets as usize);
 
         for batch in &block_engine_batches.banking_packet_batch.0 {
             for packet in batch {
@@ -677,21 +709,25 @@ impl BlockEngineRelayerHandler {
                     };
 
                     if is_forwardable {
-                        if let Some(packet) = packet_to_proto_packet(packet) {
-                            filtered_packets.push(packet)
+                        if let Some(transaction) =
+                            sanitize_transaction(tx, address_lookup_table_cache)
+                                .ok()
+                                .and_then(sanitized_to_proto_sanitized)
+                        {
+                            filtered_transactions.push(transaction);
                         }
                     }
                 }
             }
         }
 
-        if !filtered_packets.is_empty() {
-            Some(ExpiringPacketBatch {
+        if !filtered_transactions.is_empty() {
+            Some(ExpiringSanitizedTransactionBatch {
                 header: Some(Header {
                     ts: Some(Timestamp::from(block_engine_batches.stamp)),
                 }),
-                batch: Some(ProtoPacketBatch {
-                    packets: filtered_packets,
+                batch: Some(SanitizedTransactionBatch {
+                    transactions: filtered_transactions,
                 }),
                 expiry_ms: block_engine_batches.expiration,
             })
@@ -703,11 +739,11 @@ impl BlockEngineRelayerHandler {
     /// Checks the heartbeat timeout and errors out if the heartbeat didn't come in time.
     /// Assuming that's okay, sends a heartbeat back and if that fails, disconnect.
     async fn check_and_send_heartbeat(
-        block_engine_packet_sender: &Sender<PacketBatchUpdate>,
+        block_engine_packet_sender: &Sender<SanitizedTransactionBatchUpdate>,
         heartbeat_count: &u64,
     ) -> BlockEngineResult<()> {
         if let Err(e) = block_engine_packet_sender
-            .send(PacketBatchUpdate {
+            .send(SanitizedTransactionBatchUpdate {
                 msg: Some(Msg::Heartbeat(Heartbeat {
                     count: *heartbeat_count,
                 })),
@@ -755,7 +791,7 @@ fn is_aoi_in_lookup_table(
                     if let Some(writable_account) = lookup_info.addresses.get(*idx as usize) {
                         if accounts_of_interest.cache_get(writable_account).is_some()
                             // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
-                            // also txs can say programs are write-locked, but they're demoted to read-locked when loaded.
+                            // also txs can say programs are write-locked, but they're demoted to read-locked when loaded. 
                             || programs_of_interest.cache_get(writable_account).is_some()
                         {
                             return true;
@@ -776,4 +812,58 @@ fn is_aoi_in_lookup_table(
         }
     }
     false
+}
+
+fn sanitize_transaction(
+    tx: VersionedTransaction,
+    address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
+) -> Result<SanitizedTransaction, TransactionError> {
+    SanitizedTransaction::try_create(
+        tx,
+        MessageHash::Compute,
+        None,
+        AltCache(address_lookup_table_cache),
+    )
+}
+
+#[derive(Clone)]
+struct AltCache<'a>(&'a DashMap<Pubkey, AddressLookupTableAccount>);
+impl AddressLoader for AltCache<'_> {
+    fn load_addresses(
+        self,
+        lookups: &[MessageAddressTableLookup],
+    ) -> Result<LoadedAddresses, AddressLoaderError> {
+        lookups
+            .iter()
+            .map(|lookup| {
+                let account = self
+                    .0
+                    .get(&lookup.account_key)
+                    .ok_or(AddressLoaderError::LookupTableAccountNotFound)?;
+                let writable = lookup
+                    .writable_indexes
+                    .iter()
+                    .map(|&index| {
+                        account
+                            .addresses
+                            .get(index as usize)
+                            .copied()
+                            .ok_or(AddressLoaderError::InvalidLookupIndex)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let readonly = lookup
+                    .readonly_indexes
+                    .iter()
+                    .map(|&index| {
+                        account
+                            .addresses
+                            .get(index as usize)
+                            .copied()
+                            .ok_or(AddressLoaderError::InvalidLookupIndex)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(LoadedAddresses { writable, readonly })
+            })
+            .collect()
+    }
 }
