@@ -1,5 +1,5 @@
 [package]
-name = "jito-block-engine"
+name = "forge-block-engine"
 description = "Relayer Block Engine Client"
 version = { workspace = true }
 authors = { workspace = true }
@@ -15,8 +15,6 @@ jito-core = { workspace = true }
 jito-protos = { workspace = true }
 log = { workspace = true }
 prost-types = { workspace = true }
-rand.workspace = true
-reqwest = "0.11.25"
 solana-core = { workspace = true }
 solana-metrics = { workspace = true }
 solana-perf = { workspace = true }
@@ -25,3 +23,4 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+jito-block-engine = { workspace = true }

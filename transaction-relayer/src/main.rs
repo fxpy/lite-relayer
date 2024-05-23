@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::Range,
     path::PathBuf,
     str::FromStr,
     sync::{
@@ -17,6 +18,7 @@ use clap::Parser;
 use crossbeam_channel::tick;
 use dashmap::DashMap;
 use env_logger::Env;
+use forge_block_engine::block_engine::{BlockEngineConfig as ForgeBlockEngineConfig, BlockEngineRelayerHandler as ForgeBlockEngineRelayerHandler};
 use jito_block_engine::block_engine::{BlockEngineConfig, BlockEngineRelayerHandler};
 use jito_core::{
     graceful_panic,
@@ -46,8 +48,10 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{read_keypair_file, Signer},
 };
+use solana_validator::admin_rpc_service::StakedNodesOverrides;
 use tikv_jemallocator::Jemalloc;
-use tokio::{runtime::Builder, signal, sync::mpsc::channel};
+use tokio::{runtime::Builder, signal, sync::broadcast};
+use tokio::sync::watch;
 use tonic::transport::Server;
 
 // no-op change to test ci
@@ -58,25 +62,40 @@ static GLOBAL: Jemalloc = Jemalloc;
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    /// Port to bind to advertise for TPU
-    /// NOTE: There is no longer a socket created at this port since UDP transaction receiving is
-    /// deprecated.
-    #[arg(long, env, default_value_t = 11_222)]
+    /// DEPRECATED, will be removed in a future release.
+    #[deprecated(since = "0.1.8", note = "UDP TPU disabled")]
+    #[arg(long, env, default_value_t = 0)]
     tpu_port: u16,
 
-    /// Port to bind to for tpu fwd packets
-    /// NOTE: There is no longer a socket created at this port since UDP transaction receiving is
-    /// deprecated.
-    #[arg(long, env, default_value_t = 11_223)]
+    /// DEPRECATED, will be removed in a future release.
+    #[deprecated(since = "0.1.8", note = "UDP TPU_FWD disabled")]
+    #[arg(long, env, default_value_t = 0)]
     tpu_fwd_port: u16,
 
-    /// Port to bind to for tpu packets. Needs to be tpu_port + 6
+    /// Port to bind to for tpu quic packets.
+    /// The TPU will bind to all ports in the range of (tpu_quic_port, tpu_quic_port + num_tpu_quic_servers).
+    /// Open firewall ports for this entire range
+    /// Make sure to not overlap any tpu forward ports with the normal tpu ports.
+    /// Note: get_tpu_configs will return ths port - 6 to validators to match old UDP TPU definition.
     #[arg(long, env, default_value_t = 11_228)]
     tpu_quic_port: u16,
 
-    /// Port to bind to for tpu fwd packets. Needs to be tpu_fwd_port + 6
+    /// Number of tpu quic servers to spawn.
+    #[arg(long, env, default_value_t = 1)]
+    num_tpu_quic_servers: u16,
+
+    /// Port to bind to for tpu quic fwd packets.
+    /// Make sure to set this to at least (num_tpu_fwd_quic_servers + 6) higher than tpu_fwd_quic_port,
+    /// to avoid overlap any tpu forward ports with the normal tpu ports.
+    /// TPU_FWD will bind to all ports in the range of (tpu_fwd_quic_port, tpu_fwd_quic_port + num_tpu_fwd_quic_servers).
+    /// Open firewall ports for this entire range
+    /// Note: get_tpu_configs will return ths port - 6 to validators to match old UDP TPU definition.
     #[arg(long, env, default_value_t = 11_229)]
     tpu_quic_fwd_port: u16,
+
+    /// Number of tpu fwd quic servers to spawn.
+    #[arg(long, env, default_value_t = 1)]
+    num_tpu_fwd_quic_servers: u16,
 
     /// Bind IP address for GRPC server
     #[arg(long, env, default_value_t = IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)))]
@@ -115,6 +134,16 @@ struct Args {
     /// Packet delay in milliseconds
     #[arg(long, env, default_value_t = 200)]
     packet_delay_ms: u32,
+
+    /// Address for Forge Block Engine.
+    /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
+    #[arg(long, env)]
+    forge_block_engine_url: Option<String>,
+
+    /// Manual override for authentication service address of the block-engine.
+    /// Defaults to `--block-engine-url`
+    #[arg(long, env)]
+    forge_block_engine_auth_service_url: Option<String>,
 
     /// Address for Jito Block Engine.
     /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
@@ -193,6 +222,10 @@ struct Args {
     #[arg(long, env, default_value_t = 500)]
     max_unstaked_quic_connections: usize,
 
+    /// Max unstaked connections for the QUIC server
+    #[arg(long, env, default_value_t = 2000)]
+    max_staked_quic_connections: usize,
+
     /// Number of packets to send in each packet batch to the validator
     #[arg(long, env, default_value_t = 4)]
     validator_packet_batch_size: usize,
@@ -200,6 +233,21 @@ struct Args {
     /// Disable Mempool forwarding
     #[arg(long, env, default_value_t = false)]
     disable_mempool: bool,
+
+    /// Forward all received packets to all connected validators,
+    /// regardless of leader schedule.  
+    /// Note: This is required to be true for Stake Weighted Quality of Service (SWQOS)!
+    #[arg(long, env, default_value_t = false)]
+    forward_all: bool,
+
+    /// Staked Nodes Overrides Path
+    /// Provide path to a yaml file with custom overrides for stakes of specific
+    ///  identities. Overriding the amount of stake this validator considers as valid
+    ///  for other peers in network. The stake amount is used for calculating the
+    ///  number of QUIC streams permitted from the peer and vote packet sender stage.
+    ///  Format of the file: `staked_map_id: {<pubkey>: <SOL stake amount>}
+    #[arg(long, env)]
+    staked_nodes_overrides: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -210,29 +258,61 @@ struct Sockets {
 }
 
 fn get_sockets(args: &Args) -> Sockets {
-    let (tpu_quic_bind_port, mut tpu_quic_sockets) = multi_bind_in_range(
-        IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
-        (args.tpu_quic_port, args.tpu_quic_port + 1),
-        1,
-    )
-    .expect("to bind tpu_quic sockets");
+    assert!(args.num_tpu_quic_servers < u16::MAX);
+    assert!(args.num_tpu_fwd_quic_servers < u16::MAX);
 
-    let (tpu_fwd_quic_bind_port, mut tpu_fwd_quic_sockets) = multi_bind_in_range(
-        IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
-        (args.tpu_quic_fwd_port, args.tpu_quic_fwd_port + 1),
-        1,
-    )
-    .expect("to bind tpu_quic sockets");
+    let tpu_ports = Range {
+        start: args.tpu_quic_port,
+        end: args
+            .tpu_quic_port
+            .checked_add(args.num_tpu_quic_servers)
+            .unwrap(),
+    };
+    let tpu_fwd_ports = Range {
+        start: args.tpu_quic_fwd_port,
+        end: args
+            .tpu_quic_fwd_port
+            .checked_add(args.num_tpu_fwd_quic_servers)
+            .unwrap(),
+    };
 
-    assert_eq!(tpu_quic_bind_port, args.tpu_quic_port);
-    assert_eq!(tpu_fwd_quic_bind_port, args.tpu_quic_fwd_port);
-    assert_eq!(args.tpu_port + 6, tpu_quic_bind_port); // QUIC is expected to be at TPU + 6
-    assert_eq!(args.tpu_fwd_port + 6, tpu_fwd_quic_bind_port); // QUIC is expected to be at TPU forward + 6
+    for tpu_port in tpu_ports.start..tpu_ports.end {
+        assert!(!tpu_fwd_ports.contains(&tpu_port));
+    }
+
+    let (tpu_p, tpu_quic_sockets): (Vec<_>, Vec<_>) = (0..args.num_tpu_quic_servers)
+        .map(|i| {
+            let (port, mut sock) = multi_bind_in_range(
+                IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
+                (tpu_ports.start + i, tpu_ports.start + 1 + i),
+                1,
+            )
+            .unwrap();
+
+            (port, sock.pop().unwrap())
+        })
+        .unzip();
+
+    let (tpu_fwd_p, tpu_fwd_quic_sockets): (Vec<_>, Vec<_>) = (0..args.num_tpu_fwd_quic_servers)
+        .map(|i| {
+            let (port, mut sock) = multi_bind_in_range(
+                IpAddr::V4(Ipv4Addr::from([0, 0, 0, 0])),
+                (tpu_fwd_ports.start + i, tpu_fwd_ports.start + 1 + i),
+                1,
+            )
+            .unwrap();
+
+            (port, sock.pop().unwrap())
+        })
+        .unzip();
+
+    assert_eq!(tpu_ports.collect::<Vec<_>>(), tpu_p);
+    assert_eq!(tpu_fwd_ports.collect::<Vec<_>>(), tpu_fwd_p);
 
     Sockets {
         tpu_sockets: TpuSockets {
-            transactions_quic_sockets: tpu_quic_sockets.pop().unwrap(),
-            transactions_forwards_quic_sockets: tpu_fwd_quic_sockets.pop().unwrap(),
+            transactions_quic_sockets: tpu_quic_sockets,
+            transactions_forwards_quic_sockets: tpu_fwd_quic_sockets,
         },
         tpu_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         tpu_fwd_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
@@ -290,7 +370,24 @@ fn main() {
     assert!(args.grpc_bind_ip.is_ipv4(), "must bind to IPv4 address");
 
     let sockets = get_sockets(&args);
-    info!("Relayer listening at: {sockets:?}");
+
+    // make sure to allow your firewall to accept UDP packets on these ports
+    // if you're using staked overrides, you can provide one of these addresses
+    // to --rpc-send-transaction-tpu-peer
+    for s in &sockets.tpu_sockets.transactions_quic_sockets {
+        info!(
+            "TPU quic socket is listening at: {}:{}",
+            public_ip.to_string(),
+            s.local_addr().unwrap().port()
+        );
+    }
+    for s in &sockets.tpu_sockets.transactions_forwards_quic_sockets {
+        info!(
+            "TPU forward quic socket is listening at: {}:{}",
+            public_ip.to_string(),
+            s.local_addr().unwrap().port()
+        );
+    }
 
     let keypair =
         Arc::new(read_keypair_file(args.keypair_path).expect("keypair file does not exist"));
@@ -338,6 +435,19 @@ fn main() {
         &exit,
     );
 
+    let staked_nodes_overrides = match args.staked_nodes_overrides {
+        None => StakedNodesOverrides::default(),
+        Some(p) => {
+            let file = fs::File::open(&p).expect(&format!(
+                "Failed to open staked nodes overrides file: {:?}",
+                &p
+            ));
+            serde_yaml::from_reader(file).expect(&format!(
+                "Failed to read staked nodes overrides file: {:?}",
+                &p,
+            ))
+        }
+    };
     let (tpu, verified_receiver) = Tpu::new(
         sockets.tpu_sockets,
         &exit,
@@ -346,6 +456,8 @@ fn main() {
         &sockets.tpu_fwd_ip,
         &rpc_load_balancer,
         args.max_unstaked_quic_connections,
+        args.max_staked_quic_connections,
+        staked_nodes_overrides.staked_map_id,
     );
 
     let leader_cache = LeaderScheduleCacheUpdater::new(&rpc_load_balancer, &exit);
@@ -357,9 +469,10 @@ fn main() {
     // NOTE: make sure the channel here isn't too big because it will get backed up
     // with packets when the block engine isn't connected
     // tracked as forwarder_metrics.block_engine_sender_len
-    // TODO block engine -> pbs stage
     let (block_engine_sender, block_engine_receiver) =
-        channel(transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
+        broadcast::channel(transaction_relayer::forwarder::BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY);
+
+    let jito_block_engine_receiver = block_engine_sender.subscribe();
 
     let forward_and_delay_threads = start_forward_and_delay_thread(
         verified_receiver,
@@ -371,8 +484,37 @@ fn main() {
         &exit,
     );
 
+    let (connected_validators_sender, connected_validators_watch) = watch::channel(Default::default());
+
+    // Forge Block Engine
+    let is_connected_to_forge_block_engine = Arc::new(AtomicBool::new(false));
+    let forge_block_engine_config = if !args.disable_mempool && args.forge_block_engine_url.is_some() {
+        let block_engine_url = args.forge_block_engine_url.unwrap();
+        let auth_service_url = args
+            .forge_block_engine_auth_service_url
+            .unwrap_or(block_engine_url.clone());
+        Some(ForgeBlockEngineConfig {
+            block_engine_url,
+            auth_service_url,
+        })
+    } else {
+        None
+    };
+    let forge_block_engine_forwarder = ForgeBlockEngineRelayerHandler::new(
+        forge_block_engine_config,
+        block_engine_receiver,
+        connected_validators_watch,
+        keypair.clone(),
+        exit.clone(),
+        args.aoi_cache_ttl_secs,
+        address_lookup_table_cache.clone(),
+        &is_connected_to_forge_block_engine,
+        ofac_addresses.clone(),
+    );
+
+    // Jito Block Engine
     let is_connected_to_block_engine = Arc::new(AtomicBool::new(false));
-    let block_engine_config = if !args.disable_mempool && args.block_engine_url.is_some() {
+    let jito_block_engine_config = if !args.disable_mempool && args.block_engine_url.is_some() {
         let block_engine_url = args.block_engine_url.unwrap();
         let auth_service_url = args
             .block_engine_auth_service_url
@@ -384,9 +526,9 @@ fn main() {
     } else {
         None
     };
-    let block_engine_forwarder = BlockEngineRelayerHandler::new(
-        block_engine_config,
-        block_engine_receiver,
+    let jito_block_engine_forwarder = BlockEngineRelayerHandler::new(
+        jito_block_engine_config,
+        jito_block_engine_receiver,
         keypair,
         exit.clone(),
         args.aoi_cache_ttl_secs,
@@ -410,15 +552,18 @@ fn main() {
     let relayer_svc = RelayerImpl::new(
         downstream_slot_receiver,
         delay_packet_receiver,
+        connected_validators_sender,
         leader_cache.handle(),
         public_ip,
-        args.tpu_port,
-        args.tpu_fwd_port,
+        (args.tpu_quic_port..args.tpu_quic_port + args.num_tpu_quic_servers as u16).collect(),
+        (args.tpu_quic_fwd_port..args.tpu_quic_fwd_port + args.num_tpu_fwd_quic_servers as u16)
+            .collect(),
         health_manager.handle(),
         exit.clone(),
         ofac_addresses,
         address_lookup_table_cache,
         args.validator_packet_batch_size,
+        args.forward_all,
     );
 
     let priv_key = fs::read(&args.signing_key_pem_path).unwrap_or_else(|_| {
@@ -501,7 +646,8 @@ fn main() {
         t.join().unwrap();
     }
     lookup_table_refresher.join().unwrap();
-    block_engine_forwarder.join();
+    forge_block_engine_forwarder.join();
+    jito_block_engine_forwarder.join();
 }
 
 pub async fn shutdown_signal(exit: Arc<AtomicBool>) {

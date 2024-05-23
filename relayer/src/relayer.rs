@@ -2,7 +2,7 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     net::IpAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
     thread,
@@ -37,6 +37,7 @@ use solana_sdk::{
 };
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, error::TrySendError, Sender as TokioSender};
+use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -375,17 +376,14 @@ pub enum RelayerError {
 
 pub type RelayerResult<T> = Result<T, RelayerError>;
 
+type PacketSubscriptions =
+    Arc<RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>>;
 pub struct RelayerHandle {
-    packet_subscriptions:
-        Arc<RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>>,
+    packet_subscriptions: PacketSubscriptions,
 }
 
 impl RelayerHandle {
-    pub fn new(
-        packet_subscriptions: &Arc<
-            RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>,
-        >,
-    ) -> RelayerHandle {
+    pub fn new(packet_subscriptions: &PacketSubscriptions) -> RelayerHandle {
         RelayerHandle {
             packet_subscriptions: packet_subscriptions.clone(),
         }
@@ -402,15 +400,15 @@ impl RelayerHandle {
 }
 
 pub struct RelayerImpl {
-    tpu_port: u16,
-    tpu_fwd_port: u16,
+    tpu_quic_ports: Vec<u16>,
+    tpu_fwd_quic_ports: Vec<u16>,
     public_ip: IpAddr,
+    seq: AtomicU64,
 
     subscription_sender: Sender<Subscription>,
     threads: Vec<JoinHandle<()>>,
     health_state: Arc<RwLock<HealthState>>,
-    packet_subscriptions:
-        Arc<RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>>,
+    packet_subscriptions: PacketSubscriptions,
 }
 
 impl RelayerImpl {
@@ -420,15 +418,17 @@ impl RelayerImpl {
     pub fn new(
         slot_receiver: Receiver<Slot>,
         delay_packet_receiver: Receiver<RelayerPacketBatches>,
+        connected_validators_sender: watch::Sender<HashSet<Pubkey>>,
         leader_schedule_cache: LeaderScheduleUpdatingHandle,
         public_ip: IpAddr,
-        tpu_port: u16,
-        tpu_fwd_port: u16,
+        tpu_quic_ports: Vec<u16>,
+        tpu_fwd_quic_ports: Vec<u16>,
         health_state: Arc<RwLock<HealthState>>,
         exit: Arc<AtomicBool>,
         ofac_addresses: HashSet<Pubkey>,
         address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         validator_packet_batch_size: usize,
+        forward_all: bool,
     ) -> Self {
         const LEADER_LOOKAHEAD: u64 = 2;
 
@@ -441,6 +441,7 @@ impl RelayerImpl {
         let thread = {
             let health_state = health_state.clone();
             let packet_subscriptions = packet_subscriptions.clone();
+            let connected_validators_sender = connected_validators_sender.clone();
             thread::Builder::new()
                 .name("relayer_impl-event_loop_thread".to_string())
                 .spawn(move || {
@@ -453,9 +454,11 @@ impl RelayerImpl {
                         health_state,
                         exit,
                         &packet_subscriptions,
+                        &connected_validators_sender,
                         ofac_addresses,
                         address_lookup_table_cache,
                         validator_packet_batch_size,
+                        forward_all,
                     );
                     warn!("RelayerImpl thread exited with result {res:?}")
                 })
@@ -463,13 +466,14 @@ impl RelayerImpl {
         };
 
         Self {
-            tpu_port,
-            tpu_fwd_port,
+            tpu_quic_ports,
+            tpu_fwd_quic_ports,
             subscription_sender,
             public_ip,
             threads: vec![thread],
             health_state,
             packet_subscriptions,
+            seq: AtomicU64::new(0),
         }
     }
 
@@ -486,12 +490,12 @@ impl RelayerImpl {
         leader_lookahead: u64,
         health_state: Arc<RwLock<HealthState>>,
         exit: Arc<AtomicBool>,
-        packet_subscriptions: &Arc<
-            RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>,
-        >,
+        packet_subscriptions: &PacketSubscriptions,
+        validators_sender: &watch::Sender<HashSet<Pubkey>>,
         ofac_addresses: HashSet<Pubkey>,
         address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         validator_packet_batch_size: usize,
+        forward_all: bool,
     ) -> RelayerResult<()> {
         let mut highest_slot = Slot::default();
 
@@ -522,13 +526,13 @@ impl RelayerImpl {
                 },
                 recv(delay_packet_receiver) -> maybe_packet_batches => {
                     let start = Instant::now();
-                    let failed_forwards = Self::forward_packets(maybe_packet_batches, packet_subscriptions, &slot_leaders, &mut relayer_metrics, &ofac_addresses, &address_lookup_table_cache, validator_packet_batch_size)?;
-                    Self::drop_connections(failed_forwards, packet_subscriptions, &mut relayer_metrics);
+                    let failed_forwards = Self::forward_packets(maybe_packet_batches, packet_subscriptions, &slot_leaders, &mut relayer_metrics, &ofac_addresses, &address_lookup_table_cache, validator_packet_batch_size, forward_all)?;
+                    Self::drop_connections(failed_forwards, packet_subscriptions, validators_sender, &mut relayer_metrics);
                     let _ = relayer_metrics.crossbeam_delay_packet_receiver_processing_us.increment(start.elapsed().as_micros() as u64);
                 },
                 recv(subscription_receiver) -> maybe_subscription => {
                     let start = Instant::now();
-                    Self::handle_subscription(maybe_subscription, packet_subscriptions, &mut relayer_metrics)?;
+                    Self::handle_subscription(maybe_subscription, packet_subscriptions, validators_sender, &mut relayer_metrics)?;
                     let _ = relayer_metrics.crossbeam_subscription_receiver_processing_us.increment(start.elapsed().as_micros() as u64);
                 }
                 recv(heartbeat_tick) -> time_generated => {
@@ -547,7 +551,7 @@ impl RelayerImpl {
                         },
                         HealthState::Unhealthy => packet_subscriptions.read().unwrap().keys().cloned().collect(),
                     };
-                    Self::drop_connections(pubkeys_to_drop, packet_subscriptions, &mut relayer_metrics);
+                    Self::drop_connections(pubkeys_to_drop, packet_subscriptions, validators_sender, &mut relayer_metrics);
                     let _ = relayer_metrics.crossbeam_heartbeat_tick_processing_us.increment(start.elapsed().as_micros() as u64);
                 }
                 recv(metrics_tick) -> time_generated => {
@@ -582,16 +586,15 @@ impl RelayerImpl {
 
     fn drop_connections(
         disconnected_pubkeys: Vec<Pubkey>,
-        subscriptions: &Arc<
-            RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>,
-        >,
+        subscriptions: &PacketSubscriptions,
+        validators_sender: &watch::Sender<HashSet<Pubkey>>,
         relayer_metrics: &mut RelayerMetrics,
     ) {
         relayer_metrics.num_removed_connections += disconnected_pubkeys.len() as u64;
 
         let mut l_subscriptions = subscriptions.write().unwrap();
-        for disconnected in disconnected_pubkeys {
-            if let Some(sender) = l_subscriptions.remove(&disconnected) {
+        for disconnected in &disconnected_pubkeys {
+            if let Some(sender) = l_subscriptions.remove(disconnected) {
                 datapoint_info!(
                     "relayer_removed_subscription",
                     ("pubkey", disconnected.to_string(), String)
@@ -599,12 +602,13 @@ impl RelayerImpl {
                 drop(sender);
             }
         }
+        validators_sender.send_if_modified(|validators| {
+            disconnected_pubkeys.iter().any(|disconnected| validators.remove(disconnected))
+        });
     }
 
     fn handle_heartbeat(
-        subscriptions: &Arc<
-            RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>,
-        >,
+        subscriptions: &PacketSubscriptions,
         relayer_metrics: &mut RelayerMetrics,
     ) -> Vec<Pubkey> {
         let failed_pubkey_updates = subscriptions
@@ -638,14 +642,13 @@ impl RelayerImpl {
     /// Returns pubkeys of subscribers that failed to send
     fn forward_packets(
         maybe_packet_batches: Result<RelayerPacketBatches, RecvError>,
-        subscriptions: &Arc<
-            RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>,
-        >,
+        subscriptions: &PacketSubscriptions,
         slot_leaders: &HashSet<Pubkey>,
         relayer_metrics: &mut RelayerMetrics,
         ofac_addresses: &HashSet<Pubkey>,
         address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         validator_packet_batch_size: usize,
+        forward_all: bool,
     ) -> RelayerResult<Vec<Pubkey>> {
         let packet_batches = maybe_packet_batches?;
 
@@ -689,50 +692,58 @@ impl RelayerImpl {
 
         let l_subscriptions = subscriptions.read().unwrap();
 
-        let mut failed_forwards = Vec::new();
-        for pubkey in slot_leaders {
-            if let Some(sender) = l_subscriptions.get(pubkey) {
-                for batch in &proto_packet_batches {
-                    // NOTE: this is important to avoid divide-by-0 inside the validator if packets
-                    // get routed to sigverify under the assumption theres > 0 packets in the batch
-                    if batch.packets.is_empty() {
-                        continue;
-                    }
+        let senders = if forward_all {
+            l_subscriptions.iter().collect::<Vec<(
+                &Pubkey,
+                &TokioSender<Result<SubscribePacketsResponse, Status>>,
+            )>>()
+        } else {
+            slot_leaders
+                .iter()
+                .filter_map(|pubkey| l_subscriptions.get(pubkey).map(|sender| (pubkey, sender)))
+                .collect()
+        };
 
-                    // try send because it's a bounded channel and we don't want to block if the channel is full
-                    match sender.try_send(Ok(SubscribePacketsResponse {
-                        header: Some(Header {
-                            ts: Some(Timestamp::from(SystemTime::now())),
-                        }),
-                        msg: Some(subscribe_packets_response::Msg::Batch(batch.clone())),
-                    })) {
-                        Ok(_) => {
-                            relayer_metrics
-                                .increment_packets_forwarded(pubkey, batch.packets.len() as u64);
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            error!("packet channel is full for pubkey: {:?}", pubkey);
-                            relayer_metrics
-                                .increment_packets_dropped(pubkey, batch.packets.len() as u64);
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            error!("channel is closed for pubkey: {:?}", pubkey);
-                            failed_forwards.push(*pubkey);
-                            break;
-                        }
+        let mut failed_forwards = Vec::new();
+        for batch in &proto_packet_batches {
+            // NOTE: this is important to avoid divide-by-0 inside the validator if packets
+            // get routed to sigverify under the assumption theres > 0 packets in the batch
+            if batch.packets.is_empty() {
+                continue;
+            }
+
+            for (pubkey, sender) in &senders {
+                // try send because it's a bounded channel and we don't want to block if the channel is full
+                match sender.try_send(Ok(SubscribePacketsResponse {
+                    header: Some(Header {
+                        ts: Some(Timestamp::from(SystemTime::now())),
+                    }),
+                    msg: Some(subscribe_packets_response::Msg::Batch(batch.clone())),
+                })) {
+                    Ok(_) => {
+                        relayer_metrics
+                            .increment_packets_forwarded(pubkey, batch.packets.len() as u64);
+                    }
+                    Err(TrySendError::Full(_)) => {
+                        error!("packet channel is full for pubkey: {:?}", pubkey);
+                        relayer_metrics
+                            .increment_packets_dropped(pubkey, batch.packets.len() as u64);
+                    }
+                    Err(TrySendError::Closed(_)) => {
+                        error!("channel is closed for pubkey: {:?}", pubkey);
+                        failed_forwards.push(**pubkey);
+                        break;
                     }
                 }
             }
         }
-
         Ok(failed_forwards)
     }
 
     fn handle_subscription(
         maybe_subscription: Result<Subscription, RecvError>,
-        subscriptions: &Arc<
-            RwLock<HashMap<Pubkey, TokioSender<Result<SubscribePacketsResponse, Status>>>>,
-        >,
+        subscriptions: &PacketSubscriptions,
+        validators_sender: &watch::Sender<HashSet<Pubkey>>,
         relayer_metrics: &mut RelayerMetrics,
     ) -> RelayerResult<()> {
         match maybe_subscription? {
@@ -740,6 +751,7 @@ impl RelayerImpl {
                 match subscriptions.write().unwrap().entry(pubkey) {
                     Entry::Vacant(entry) => {
                         entry.insert(sender);
+                        validators_sender.send_modify(|validators| {validators.insert(pubkey);});
 
                         relayer_metrics.num_added_connections += 1;
                         datapoint_info!(
@@ -796,14 +808,16 @@ impl Relayer for RelayerImpl {
         &self,
         _: Request<GetTpuConfigsRequest>,
     ) -> Result<Response<GetTpuConfigsResponse>, Status> {
+        let seq = self.seq.fetch_add(1, Ordering::Acquire);
         return Ok(Response::new(GetTpuConfigsResponse {
             tpu: Some(Socket {
                 ip: self.public_ip.to_string(),
-                port: self.tpu_port as i64,
+                port: (self.tpu_quic_ports[seq as usize % self.tpu_quic_ports.len()] - 6) as i64,
             }),
             tpu_forward: Some(Socket {
                 ip: self.public_ip.to_string(),
-                port: self.tpu_fwd_port as i64,
+                port: (self.tpu_fwd_quic_ports[seq as usize % self.tpu_fwd_quic_ports.len()] - 6)
+                    as i64,
             }),
         }));
     }

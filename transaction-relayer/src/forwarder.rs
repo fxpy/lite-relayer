@@ -13,7 +13,6 @@ use jito_block_engine::block_engine::BlockEnginePackets;
 use jito_relayer::relayer::RelayerPacketBatches;
 use solana_core::banking_trace::BankingPacketBatch;
 use solana_metrics::datapoint_info;
-use tokio::sync::mpsc::error::TrySendError;
 
 pub const BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY: usize = 5_000;
 
@@ -23,7 +22,7 @@ pub fn start_forward_and_delay_thread(
     verified_receiver: Receiver<BankingPacketBatch>,
     delay_packet_sender: Sender<RelayerPacketBatches>,
     packet_delay_ms: u32,
-    block_engine_sender: tokio::sync::mpsc::Sender<BlockEnginePackets>,
+    block_engine_sender: tokio::sync::broadcast::Sender<BlockEnginePackets>,
     num_threads: u64,
     disable_mempool: bool,
     exit: &Arc<AtomicBool>,
@@ -48,7 +47,7 @@ pub fn start_forward_and_delay_thread(
                     let mut forwarder_metrics = ForwarderMetrics::new(
                         buffered_packet_batches.capacity(),
                         verified_receiver.capacity().unwrap_or_default(), // TODO (LB): unbounded channel now, remove metric
-                        block_engine_sender.capacity(),
+                        0, // set to 0 as broadcast doesn't have capacity method
                     );
                     let mut last_metrics_upload = Instant::now();
 
@@ -59,7 +58,7 @@ pub fn start_forward_and_delay_thread(
                             forwarder_metrics = ForwarderMetrics::new(
                                 buffered_packet_batches.capacity(),
                                 verified_receiver.capacity().unwrap_or_default(), // TODO (LB): unbounded channel now, remove metric
-                                block_engine_sender.capacity(),
+                                0, // set to 0 as broadcast doesn't have capacity method
                             );
                             last_metrics_upload = Instant::now();
                         }
@@ -80,7 +79,7 @@ pub fn start_forward_and_delay_thread(
                                 // and we don't want to OOM on packet_receiver
                                 if !disable_mempool {
                                     // TODO block engine -> pbs stage
-                                    match block_engine_sender.try_send(BlockEnginePackets {
+                                    match block_engine_sender.send(BlockEnginePackets {
                                         banking_packet_batch: banking_packet_batch.clone(),
                                         stamp: system_time,
                                         expiration: packet_delay_ms,
@@ -89,13 +88,8 @@ pub fn start_forward_and_delay_thread(
                                             forwarder_metrics.num_be_packets_forwarded +=
                                                 num_packets;
                                         }
-                                        Err(TrySendError::Closed(_)) => {
-                                            panic!(
-                                                "error sending packet batch to block engine handler"
-                                            );
-                                        }
-                                        Err(TrySendError::Full(_)) => {
-                                            // block engine most likely not connected
+                                        Err(_) => {
+                                            // block engine most likely not connected - any broadcaster error means channel closed
                                             forwarder_metrics.num_be_packets_dropped += num_packets;
                                             forwarder_metrics.num_be_sender_full += 1;
                                         }
@@ -135,7 +129,7 @@ pub fn start_forward_and_delay_thread(
                             buffered_packet_batches.len(),
                             buffered_packet_batches.capacity(),
                             verified_receiver.len(),
-                            BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY - block_engine_sender.capacity(),
+                            BLOCK_ENGINE_FORWARDER_QUEUE_CAPACITY - block_engine_sender.len(),
                         );
                     }
                 })
