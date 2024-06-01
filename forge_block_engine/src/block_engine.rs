@@ -415,6 +415,9 @@ impl BlockEngineRelayerHandler {
         let mut auth_refresh_interval = interval(Duration::from_secs(60));
         let mut metrics_interval = interval(Duration::from_secs(1));
 
+        // immediately send connected validators to the block engine
+        connected_validators_watch.mark_changed();
+
         let mut heartbeat_count = 0;
         while !exit.load(Ordering::Relaxed) {
             select! {
