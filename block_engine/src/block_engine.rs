@@ -114,7 +114,6 @@ impl BlockEngineRelayerHandler {
         keypair: Arc<Keypair>,
         exit: Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: HashSet<Pubkey>,
     ) -> BlockEngineRelayerHandler {
@@ -133,7 +132,6 @@ impl BlockEngineRelayerHandler {
                                 &keypair,
                                 &exit,
                                 aoi_cache_ttl_s,
-                                &address_lookup_table_cache,
                                 &is_connected_to_block_engine,
                                 &ofac_addresses,
                             )
@@ -226,7 +224,6 @@ impl BlockEngineRelayerHandler {
         keypair: &Arc<Keypair>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
@@ -291,7 +288,6 @@ impl BlockEngineRelayerHandler {
             shared_access_token,
             exit,
             aoi_cache_ttl_s,
-            address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
         )
@@ -313,7 +309,6 @@ impl BlockEngineRelayerHandler {
         shared_access_token: Arc<Mutex<Token>>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
@@ -345,7 +340,6 @@ impl BlockEngineRelayerHandler {
             shared_access_token,
             exit,
             aoi_cache_ttl_s,
-            address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
         )
@@ -364,7 +358,6 @@ impl BlockEngineRelayerHandler {
         shared_access_token: Arc<Mutex<Token>>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
@@ -435,7 +428,7 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.0.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
+                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, ofac_addresses);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
                     if let Some(filtered_packets) = filtered_packets {
@@ -642,7 +635,6 @@ impl BlockEngineRelayerHandler {
         num_packets: u64,
         accounts_of_interest: &mut TimedCache<Pubkey, u8>,
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
-        address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> Option<ExpiringPacketBatch> {
         let mut filtered_packets = Vec::with_capacity(num_packets as usize);
@@ -656,24 +648,8 @@ impl BlockEngineRelayerHandler {
                 if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
                     let is_forwardable = if ofac_addresses.is_empty() {
                         is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
-                            || is_aoi_in_lookup_table(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                                address_lookup_table_cache,
-                            )
                     } else {
-                        !is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
-                            && (is_aoi_in_static_keys(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                            ) || is_aoi_in_lookup_table(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                                address_lookup_table_cache,
-                            ))
+                        is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
                     };
 
                     if is_forwardable {

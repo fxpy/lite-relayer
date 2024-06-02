@@ -425,16 +425,6 @@ fn main() {
     let (rpc_load_balancer, slot_receiver) = LoadBalancer::new(&servers, &exit);
     let rpc_load_balancer = Arc::new(rpc_load_balancer);
 
-    // Lookup table refresher
-    let address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>> =
-        Arc::new(DashMap::new());
-    let lookup_table_refresher = start_lookup_table_refresher(
-        &rpc_load_balancer,
-        &address_lookup_table_cache,
-        Duration::from_secs(args.lookup_table_refresh_secs),
-        &exit,
-    );
-
     let staked_nodes_overrides = match args.staked_nodes_overrides {
         None => StakedNodesOverrides::default(),
         Some(p) => {
@@ -493,21 +483,19 @@ fn main() {
         let auth_service_url = args
             .forge_block_engine_auth_service_url
             .unwrap_or(block_engine_url.clone());
-        Some(ForgeBlockEngineConfig {
+        Some(BlockEngineConfig {
             block_engine_url,
             auth_service_url,
         })
     } else {
         None
     };
-    let forge_block_engine_forwarder = ForgeBlockEngineRelayerHandler::new(
+    let forge_block_engine_forwarder = BlockEngineRelayerHandler::new(
         forge_block_engine_config,
         block_engine_receiver,
-        connected_validators_watch,
         keypair.clone(),
         exit.clone(),
         args.aoi_cache_ttl_secs,
-        address_lookup_table_cache.clone(),
         &is_connected_to_forge_block_engine,
         ofac_addresses.clone(),
     );
@@ -532,7 +520,6 @@ fn main() {
         keypair,
         exit.clone(),
         args.aoi_cache_ttl_secs,
-        address_lookup_table_cache.clone(),
         &is_connected_to_block_engine,
         ofac_addresses.clone(),
     );
@@ -561,7 +548,6 @@ fn main() {
         health_manager.handle(),
         exit.clone(),
         ofac_addresses,
-        address_lookup_table_cache,
         args.validator_packet_batch_size,
         args.forward_all,
     );
@@ -645,7 +631,6 @@ fn main() {
     for t in forward_and_delay_threads {
         t.join().unwrap();
     }
-    lookup_table_refresher.join().unwrap();
     forge_block_engine_forwarder.join();
     jito_block_engine_forwarder.join();
 }
@@ -692,102 +677,4 @@ impl ValidatorAuther for ValidatorAutherImpl {
             ValidatorStore::UserDefined(pubkeys) => pubkeys.contains(pubkey),
         }
     }
-}
-
-fn start_lookup_table_refresher(
-    rpc_load_balancer: &Arc<LoadBalancer>,
-    lookup_table: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
-    refresh_duration: Duration,
-    exit: &Arc<AtomicBool>,
-) -> JoinHandle<()> {
-    let rpc_load_balancer = rpc_load_balancer.clone();
-    let exit = exit.clone();
-    let lookup_table = lookup_table.clone();
-
-    thread::Builder::new()
-        .name("lookup_table_refresher".to_string())
-        .spawn(move || {
-            // seed lookup table
-            if let Err(e) = refresh_address_lookup_table(&rpc_load_balancer, &lookup_table) {
-                error!("error refreshing address lookup table: {e:?}");
-            }
-
-            let tick_receiver = tick(Duration::from_secs(1));
-            let mut last_refresh = Instant::now();
-
-            while !exit.load(Ordering::Relaxed) {
-                let _ = tick_receiver.recv();
-                if last_refresh.elapsed() < refresh_duration {
-                    continue;
-                }
-
-                let now = Instant::now();
-                let refresh_result =
-                    refresh_address_lookup_table(&rpc_load_balancer, &lookup_table);
-                let updated_elapsed = now.elapsed().as_micros();
-                match refresh_result {
-                    Ok(_) => {
-                        datapoint_info!(
-                            "lookup_table_refresher-ok",
-                            ("count", 1, i64),
-                            ("lookup_table_size", lookup_table.len(), i64),
-                            ("updated_elapsed_us", updated_elapsed, i64),
-                        );
-                    }
-                    Err(e) => {
-                        datapoint_error!(
-                            "lookup_table_refresher-error",
-                            ("count", 1, i64),
-                            ("lookup_table_size", lookup_table.len(), i64),
-                            ("updated_elapsed_us", updated_elapsed, i64),
-                            ("error", e.to_string(), String),
-                        );
-                    }
-                }
-                last_refresh = Instant::now();
-            }
-        })
-        .unwrap()
-}
-
-fn refresh_address_lookup_table(
-    rpc_load_balancer: &Arc<LoadBalancer>,
-    lookup_table: &DashMap<Pubkey, AddressLookupTableAccount>,
-) -> solana_client::client_error::Result<()> {
-    let rpc_client = rpc_load_balancer.rpc_client();
-
-    let address_lookup_table =
-        Pubkey::from_str("AddressLookupTab1e1111111111111111111111111").unwrap();
-    let start = Instant::now();
-    let accounts = rpc_client.get_program_accounts(&address_lookup_table)?;
-    info!(
-        "Fetched {} lookup tables from RPC in {:?}",
-        accounts.len(),
-        start.elapsed()
-    );
-
-    let mut new_pubkeys = HashSet::new();
-    for (pubkey, account_data) in accounts {
-        match AddressLookupTable::deserialize(&account_data.data) {
-            Err(e) => {
-                error!("error deserializing AddressLookupTable pubkey: {pubkey}, error: {e}");
-            }
-            Ok(table) => {
-                debug!("lookup table loaded pubkey: {pubkey:?}, table: {table:?}");
-                new_pubkeys.insert(pubkey);
-                lookup_table.insert(
-                    pubkey,
-                    AddressLookupTableAccount {
-                        key: pubkey,
-                        addresses: table.addresses.to_vec(),
-                    },
-                );
-            }
-        }
-    }
-
-    // remove all the closed lookup tables
-    lookup_table.retain(|pubkey, _| new_pubkeys.contains(pubkey));
-
-    Ok(())
 }
