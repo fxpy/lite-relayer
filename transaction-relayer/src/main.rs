@@ -9,16 +9,15 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    thread,
-    thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use clap::Parser;
-use crossbeam_channel::tick;
-use dashmap::DashMap;
 use env_logger::Env;
-use forge_block_engine::block_engine::{BlockEngineConfig as ForgeBlockEngineConfig, BlockEngineRelayerHandler as ForgeBlockEngineRelayerHandler};
+use forge_block_engine::block_engine::{
+    BlockEngineConfig as ForgeBlockEngineConfig,
+    BlockEngineRelayerHandler as ForgeBlockEngineRelayerHandler,
+};
 use jito_block_engine::block_engine::{BlockEngineConfig, BlockEngineRelayerHandler};
 use jito_core::{
     graceful_panic,
@@ -36,23 +35,24 @@ use jito_relayer::{
 };
 use jito_relayer_web::{start_relayer_web_server, RelayerState};
 use jito_rpc::load_balancer::LoadBalancer;
-use transaction_relayer::forwarder::start_forward_and_delay_thread;
 use jwt::{AlgorithmType, PKeyWithDigest};
-use log::{debug, error, info, warn};
+use log::{info, warn};
 use openssl::{hash::MessageDigest, pkey::PKey};
-use solana_address_lookup_table_program::state::AddressLookupTable;
-use solana_metrics::{datapoint_error, datapoint_info};
+use solana_metrics::datapoint_info;
 use solana_net_utils::multi_bind_in_range;
 use solana_sdk::{
-    address_lookup_table_account::AddressLookupTableAccount,
     pubkey::Pubkey,
     signature::{read_keypair_file, Signer},
 };
 use solana_validator::admin_rpc_service::StakedNodesOverrides;
 use tikv_jemallocator::Jemalloc;
-use tokio::{runtime::Builder, signal, sync::broadcast};
-use tokio::sync::watch;
+use tokio::{
+    runtime::Builder,
+    signal,
+    sync::{broadcast, watch},
+};
 use tonic::transport::Server;
+use transaction_relayer::forwarder::start_forward_and_delay_thread;
 
 // no-op change to test ci
 
@@ -474,25 +474,28 @@ fn main() {
         &exit,
     );
 
-    let (connected_validators_sender, connected_validators_watch) = watch::channel(Default::default());
+    let (connected_validators_sender, connected_validators_watch) =
+        watch::channel(Default::default());
 
     // Forge Block Engine
     let is_connected_to_forge_block_engine = Arc::new(AtomicBool::new(false));
-    let forge_block_engine_config = if !args.disable_mempool && args.forge_block_engine_url.is_some() {
-        let block_engine_url = args.forge_block_engine_url.unwrap();
-        let auth_service_url = args
-            .forge_block_engine_auth_service_url
-            .unwrap_or(block_engine_url.clone());
-        Some(BlockEngineConfig {
-            block_engine_url,
-            auth_service_url,
-        })
-    } else {
-        None
-    };
-    let forge_block_engine_forwarder = BlockEngineRelayerHandler::new(
+    let forge_block_engine_config =
+        if !args.disable_mempool && args.forge_block_engine_url.is_some() {
+            let block_engine_url = args.forge_block_engine_url.unwrap();
+            let auth_service_url = args
+                .forge_block_engine_auth_service_url
+                .unwrap_or(block_engine_url.clone());
+            Some(ForgeBlockEngineConfig {
+                block_engine_url,
+                auth_service_url,
+            })
+        } else {
+            None
+        };
+    let forge_block_engine_forwarder = ForgeBlockEngineRelayerHandler::new(
         forge_block_engine_config,
         block_engine_receiver,
+        connected_validators_watch,
         keypair.clone(),
         exit.clone(),
         args.aoi_cache_ttl_secs,
@@ -542,8 +545,8 @@ fn main() {
         connected_validators_sender,
         leader_cache.handle(),
         public_ip,
-        (args.tpu_quic_port..args.tpu_quic_port + args.num_tpu_quic_servers as u16).collect(),
-        (args.tpu_quic_fwd_port..args.tpu_quic_fwd_port + args.num_tpu_fwd_quic_servers as u16)
+        (args.tpu_quic_port..args.tpu_quic_port + args.num_tpu_quic_servers).collect(),
+        (args.tpu_quic_fwd_port..args.tpu_quic_fwd_port + args.num_tpu_fwd_quic_servers)
             .collect(),
         health_manager.handle(),
         exit.clone(),

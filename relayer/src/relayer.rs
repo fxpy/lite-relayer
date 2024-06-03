@@ -11,9 +11,7 @@ use std::{
 };
 
 use crossbeam_channel::{bounded, Receiver, RecvError, Sender};
-use dashmap::DashMap;
 use histogram::Histogram;
-use jito_core::ofac::is_tx_ofac_related;
 use jito_protos::{
     convert::packet_to_proto_packet,
     packet::PacketBatch as ProtoPacketBatch,
@@ -29,15 +27,15 @@ use prost_types::Timestamp;
 use solana_core::banking_trace::BankingPacketBatch;
 use solana_metrics::datapoint_info;
 use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount,
     clock::{Slot, NUM_CONSECUTIVE_LEADER_SLOTS},
     pubkey::Pubkey,
     saturating_add_assign,
-    transaction::VersionedTransaction,
 };
 use thiserror::Error;
-use tokio::sync::mpsc::{channel, error::TrySendError, Sender as TokioSender};
-use tokio::sync::watch;
+use tokio::sync::{
+    mpsc::{channel, error::TrySendError, Sender as TokioSender},
+    watch,
+};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
@@ -600,7 +598,9 @@ impl RelayerImpl {
             }
         }
         validators_sender.send_if_modified(|validators| {
-            disconnected_pubkeys.iter().any(|disconnected| validators.remove(disconnected))
+            disconnected_pubkeys
+                .iter()
+                .any(|disconnected| validators.remove(disconnected))
         });
     }
 
@@ -642,7 +642,7 @@ impl RelayerImpl {
         subscriptions: &PacketSubscriptions,
         slot_leaders: &HashSet<Pubkey>,
         relayer_metrics: &mut RelayerMetrics,
-        ofac_addresses: &HashSet<Pubkey>,
+        _ofac_addresses: &HashSet<Pubkey>,
         validator_packet_batch_size: usize,
         forward_all: bool,
     ) -> RelayerResult<Vec<Pubkey>> {
@@ -661,14 +661,6 @@ impl RelayerImpl {
                 batch
                     .iter()
                     .filter(|p| !p.meta().discard())
-                    .filter_map(|packet| {
-                        if !ofac_addresses.is_empty() {
-                            let tx: VersionedTransaction = packet.deserialize_slice(..).ok()?;
-                            Some(packet)
-                        } else {
-                            Some(packet)
-                        }
-                    })
                     .filter_map(packet_to_proto_packet)
             })
             .collect();
@@ -742,7 +734,9 @@ impl RelayerImpl {
                 match subscriptions.write().unwrap().entry(pubkey) {
                     Entry::Vacant(entry) => {
                         entry.insert(sender);
-                        validators_sender.send_modify(|validators| {validators.insert(pubkey);});
+                        validators_sender.send_modify(|validators| {
+                            validators.insert(pubkey);
+                        });
 
                         relayer_metrics.num_added_connections += 1;
                         datapoint_info!(

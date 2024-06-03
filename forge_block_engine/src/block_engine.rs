@@ -10,8 +10,7 @@ use std::{
 };
 
 use cached::{Cached, TimedCache};
-use dashmap::DashMap;
-use jito_core::ofac::is_tx_ofac_related;
+use jito_block_engine::block_engine::BlockEnginePackets;
 use jito_protos::{
     auth::{
         auth_service_client::AuthServiceClient, GenerateAuthChallengeRequest,
@@ -19,37 +18,31 @@ use jito_protos::{
         Token,
     },
     block_engine::{
-        block_engine_relayer_client::BlockEngineRelayerClient,
-        sanitized_transaction_batch_update::Msg, AccountsOfInterestRequest,
-        AccountsOfInterestUpdate, ExpiringSanitizedTransactionBatch, ProgramsOfInterestRequest,
-        ProgramsOfInterestUpdate, SanitizedTransactionBatchUpdate,
+        block_engine_relayer_client::BlockEngineRelayerClient, AccountsOfInterestRequest,
+        AccountsOfInterestUpdate, ConnectedValidatorsUpdate, ExpiringPacketBatch,
+        PacketBatchUpdate, ProgramsOfInterestRequest, ProgramsOfInterestUpdate,
     },
-    convert::sanitized_to_proto_sanitized,
-    sanitized::SanitizedTransactionBatch,
+    convert::packet_to_proto_packet,
+    packet::PacketBatch as ProtoPacketBatch,
     shared::{Header, Heartbeat},
 };
 use log::{error, *};
 use prost_types::Timestamp;
 use solana_metrics::{datapoint_error, datapoint_info};
 use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount,
-    message::{
-        v0::{LoadedAddresses, MessageAddressTableLookup},
-        AddressLoader, AddressLoaderError,
-    },
-    pubkey::Pubkey,
-    signature::Signer,
-    signer::keypair::Keypair,
-    transaction::{MessageHash, SanitizedTransaction, TransactionError, VersionedTransaction},
+    pubkey::Pubkey, signature::Signer, signer::keypair::Keypair, transaction::VersionedTransaction,
 };
 use thiserror::Error;
 use tokio::{
     runtime::Runtime,
     select,
-    sync::mpsc::{channel, Sender},
+    sync::{
+        broadcast, mpsc,
+        mpsc::{channel, Sender},
+        watch,
+    },
     time::{interval, sleep},
 };
-use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{
     codegen::InterceptedService,
@@ -57,8 +50,6 @@ use tonic::{
     transport::{Channel, Endpoint},
     Response, Status, Streaming,
 };
-use jito_block_engine::block_engine::BlockEnginePackets;
-use jito_protos::block_engine::ConnectedValidatorsUpdate;
 
 use crate::block_engine_stats::BlockEngineStats;
 
@@ -119,7 +110,6 @@ impl BlockEngineRelayerHandler {
         keypair: Arc<Keypair>,
         exit: Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: HashSet<Pubkey>,
     ) -> BlockEngineRelayerHandler {
@@ -139,7 +129,6 @@ impl BlockEngineRelayerHandler {
                                 &keypair,
                                 &exit,
                                 aoi_cache_ttl_s,
-                                &address_lookup_table_cache,
                                 &is_connected_to_block_engine,
                                 &ofac_addresses,
                             )
@@ -235,7 +224,6 @@ impl BlockEngineRelayerHandler {
         keypair: &Arc<Keypair>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
@@ -250,7 +238,7 @@ impl BlockEngineRelayerHandler {
             .connect()
             .await
             .map_err(|e| BlockEngineError::AuthServiceFailure(e.to_string()))?;
-        
+
         let mut auth_client = AuthServiceClient::new(channel);
 
         let (access_token, mut refresh_token) = Self::auth(&mut auth_client, keypair).await?;
@@ -303,7 +291,6 @@ impl BlockEngineRelayerHandler {
             shared_access_token,
             exit,
             aoi_cache_ttl_s,
-            address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
         )
@@ -326,7 +313,6 @@ impl BlockEngineRelayerHandler {
         shared_access_token: Arc<Mutex<Token>>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
@@ -339,9 +325,8 @@ impl BlockEngineRelayerHandler {
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
-        let (connected_validators_sender, connected_validators_receiver) = mpsc::channel(
-            Self::BLOCK_ENGINE_CONNECTED_VALIDATORS_QUEUE_CAPACITY,
-        );
+        let (connected_validators_sender, connected_validators_receiver) =
+            mpsc::channel(Self::BLOCK_ENGINE_CONNECTED_VALIDATORS_QUEUE_CAPACITY);
         let _response = client
             .connected_validators_stream(ReceiverStream::new(connected_validators_receiver))
             .await
@@ -351,9 +336,7 @@ impl BlockEngineRelayerHandler {
         let (block_engine_packet_sender, block_engine_packet_receiver) =
             channel(Self::BLOCK_ENGINE_PACKET_QUEUE_CAPACITY);
         let _response = client
-            .start_expiring_sanitized_transaction_stream(ReceiverStream::new(
-                block_engine_packet_receiver,
-            ))
+            .start_expiring_packet_stream(ReceiverStream::new(block_engine_packet_receiver))
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
@@ -370,7 +353,6 @@ impl BlockEngineRelayerHandler {
             shared_access_token,
             exit,
             aoi_cache_ttl_s,
-            address_lookup_table_cache,
             is_connected_to_block_engine,
             ofac_addresses,
         )
@@ -379,7 +361,7 @@ impl BlockEngineRelayerHandler {
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_packet_stream(
-        block_engine_packet_sender: Sender<SanitizedTransactionBatchUpdate>,
+        block_engine_packet_sender: Sender<PacketBatchUpdate>,
         block_engine_receiver: &mut broadcast::Receiver<BlockEnginePackets>,
         connected_validators_sender: Sender<ConnectedValidatorsUpdate>,
         connected_validators_watch: &mut watch::Receiver<HashSet<Pubkey>>,
@@ -391,7 +373,6 @@ impl BlockEngineRelayerHandler {
         shared_access_token: Arc<Mutex<Token>>,
         exit: &Arc<AtomicBool>,
         aoi_cache_ttl_s: u64,
-        address_lookup_table_cache: &Arc<DashMap<Pubkey, AddressLookupTableAccount>>,
         is_connected_to_block_engine: &Arc<AtomicBool>,
         ofac_addresses: &HashSet<Pubkey>,
     ) -> BlockEngineResult<()> {
@@ -466,18 +447,18 @@ impl BlockEngineRelayerHandler {
                     let num_packets: u64 = block_engine_batches.banking_packet_batch.0.iter().map(|b|b.len() as u64).sum::<u64>();
                     block_engine_stats.increment_num_packets_received(num_packets);
 
-                    let filtered_transactions = Self::filter_and_sanitize(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, address_lookup_table_cache, ofac_addresses);
+                    let filtered_packets = Self::filter_packets(block_engine_batches, num_packets, &mut accounts_of_interest, &mut programs_of_interest, ofac_addresses);
                     block_engine_stats.increment_packet_filter_elapsed_us(now.elapsed().as_micros() as u64);
 
-                    if let Some(filtered_transactions) = filtered_transactions {
+                    if let Some(filtered_packets) = filtered_packets {
                         let now = Instant::now();
-                        let packet_forward_count = Self::forward_sanitized_transactions(&block_engine_packet_sender, filtered_transactions).await?;
+                        let packet_forward_count = Self::forward_packets(&block_engine_packet_sender, filtered_packets).await?;
                         block_engine_stats.increment_packet_forward_count(packet_forward_count as u64);
                         block_engine_stats.increment_packet_forward_elapsed_us(now.elapsed().as_micros() as u64);
                     }
                 }
                 maybe_changed = connected_validators_watch.changed() => {
-                    if let Ok(_) = maybe_changed {
+                    if maybe_changed.is_ok() {
                         let validators = connected_validators_watch.borrow_and_update();
                         let _ = connected_validators_sender.try_send(ConnectedValidatorsUpdate {
                             validators: validators.iter().map(|v| v.to_bytes().into()).collect()
@@ -648,16 +629,57 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Forwards sanitized transactions to the Block Engine
-    async fn forward_sanitized_transactions(
-        block_engine_packet_sender: &Sender<SanitizedTransactionBatchUpdate>,
-        batch: ExpiringSanitizedTransactionBatch,
+    /// Filters out packets that aren't on list of interest
+    fn filter_packets(
+        block_engine_batches: BlockEnginePackets,
+        num_packets: u64,
+        accounts_of_interest: &mut TimedCache<Pubkey, u8>,
+        programs_of_interest: &mut TimedCache<Pubkey, u8>,
+        _ofac_addresses: &HashSet<Pubkey>,
+    ) -> Option<ExpiringPacketBatch> {
+        let mut filtered_packets = Vec::with_capacity(num_packets as usize);
+
+        for batch in &block_engine_batches.banking_packet_batch.0 {
+            for packet in batch {
+                if packet.meta().discard() {
+                    continue;
+                }
+
+                if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
+                    if is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest) {
+                        if let Some(packet) = packet_to_proto_packet(packet) {
+                            filtered_packets.push(packet)
+                        }
+                    }
+                }
+            }
+        }
+
+        if !filtered_packets.is_empty() {
+            Some(ExpiringPacketBatch {
+                header: Some(Header {
+                    ts: Some(Timestamp::from(block_engine_batches.stamp)),
+                }),
+                batch: Some(ProtoPacketBatch {
+                    packets: filtered_packets,
+                }),
+                expiry_ms: block_engine_batches.expiration,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Forwards packets to the Block Engine
+    async fn forward_packets(
+        block_engine_packet_sender: &Sender<PacketBatchUpdate>,
+        batch: ExpiringPacketBatch,
     ) -> BlockEngineResult<usize> {
-        let num_packets = batch.batch.as_ref().unwrap().transactions.len();
+        let num_packets = batch.batch.as_ref().unwrap().packets.len();
 
         if let Err(e) = block_engine_packet_sender
-            .send(SanitizedTransactionBatchUpdate {
-                msg: Some(Msg::Batches(batch)),
+            .send(PacketBatchUpdate {
+                msg: Some(jito_protos::block_engine::packet_batch_update::Msg::Batches(batch)),
             })
             .await
         {
@@ -670,86 +692,19 @@ impl BlockEngineRelayerHandler {
         }
     }
 
-    /// Filter out packets that aren't on list of interest
-    /// and sanitize the transactions (resolve address lookups)
-    fn filter_and_sanitize(
-        block_engine_batches: BlockEnginePackets,
-        num_packets: u64,
-        accounts_of_interest: &mut TimedCache<Pubkey, u8>,
-        programs_of_interest: &mut TimedCache<Pubkey, u8>,
-        address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
-        ofac_addresses: &HashSet<Pubkey>,
-    ) -> Option<ExpiringSanitizedTransactionBatch> {
-        let mut filtered_transactions = Vec::with_capacity(num_packets as usize);
-
-        for batch in &block_engine_batches.banking_packet_batch.0 {
-            for packet in batch {
-                if packet.meta().discard() {
-                    continue;
-                }
-
-                if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
-                    let is_forwardable = if ofac_addresses.is_empty() {
-                        is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
-                            || is_aoi_in_lookup_table(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                                address_lookup_table_cache,
-                            )
-                    } else {
-                        !is_tx_ofac_related(&tx, ofac_addresses, address_lookup_table_cache)
-                            && (is_aoi_in_static_keys(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                            ) || is_aoi_in_lookup_table(
-                                &tx,
-                                accounts_of_interest,
-                                programs_of_interest,
-                                address_lookup_table_cache,
-                            ))
-                    };
-
-                    if is_forwardable {
-                        if let Some(transaction) =
-                            sanitize_transaction(tx, address_lookup_table_cache)
-                                .ok()
-                                .and_then(sanitized_to_proto_sanitized)
-                        {
-                            filtered_transactions.push(transaction);
-                        }
-                    }
-                }
-            }
-        }
-
-        if !filtered_transactions.is_empty() {
-            Some(ExpiringSanitizedTransactionBatch {
-                header: Some(Header {
-                    ts: Some(Timestamp::from(block_engine_batches.stamp)),
-                }),
-                batch: Some(SanitizedTransactionBatch {
-                    transactions: filtered_transactions,
-                }),
-                expiry_ms: block_engine_batches.expiration,
-            })
-        } else {
-            None
-        }
-    }
-
     /// Checks the heartbeat timeout and errors out if the heartbeat didn't come in time.
     /// Assuming that's okay, sends a heartbeat back and if that fails, disconnect.
     async fn check_and_send_heartbeat(
-        block_engine_packet_sender: &Sender<SanitizedTransactionBatchUpdate>,
+        block_engine_packet_sender: &Sender<PacketBatchUpdate>,
         heartbeat_count: &u64,
     ) -> BlockEngineResult<()> {
         if let Err(e) = block_engine_packet_sender
-            .send(SanitizedTransactionBatchUpdate {
-                msg: Some(Msg::Heartbeat(Heartbeat {
-                    count: *heartbeat_count,
-                })),
+            .send(PacketBatchUpdate {
+                msg: Some(
+                    jito_protos::block_engine::packet_batch_update::Msg::Heartbeat(Heartbeat {
+                        count: *heartbeat_count,
+                    }),
+                ),
             })
             .await
         {
@@ -777,96 +732,4 @@ fn is_aoi_in_static_keys(
                 // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
                 || programs_of_interest.cache_get(acc).is_some()
         })
-}
-
-/// For each lookup table, look at the writable_indexes and do a lookup in the address_lookup_table_cache
-/// to find the address. Then determine if in accounts_of_interest
-fn is_aoi_in_lookup_table(
-    tx: &VersionedTransaction,
-    accounts_of_interest: &mut TimedCache<Pubkey, u8>,
-    programs_of_interest: &mut TimedCache<Pubkey, u8>,
-    address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
-) -> bool {
-    if let Some(lookup_tables) = tx.message.address_table_lookups() {
-        for table in lookup_tables {
-            if let Some(lookup_info) = address_lookup_table_cache.get(&table.account_key) {
-                for idx in &table.writable_indexes {
-                    if let Some(writable_account) = lookup_info.addresses.get(*idx as usize) {
-                        if accounts_of_interest.cache_get(writable_account).is_some()
-                            // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
-                            // also txs can say programs are write-locked, but they're demoted to read-locked when loaded. 
-                            || programs_of_interest.cache_get(writable_account).is_some()
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                for idx in &table.readonly_indexes {
-                    if let Some(readonly_account) = lookup_info.addresses.get(*idx as usize) {
-                        // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
-                        // also txs can say programs are write-locked, but they're demoted to read-locked when loaded.
-                        if programs_of_interest.cache_get(readonly_account).is_some() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-fn sanitize_transaction(
-    tx: VersionedTransaction,
-    address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
-) -> Result<SanitizedTransaction, TransactionError> {
-    SanitizedTransaction::try_create(
-        tx,
-        MessageHash::Compute,
-        None,
-        AltCache(address_lookup_table_cache),
-    )
-}
-
-#[derive(Clone)]
-struct AltCache<'a>(&'a DashMap<Pubkey, AddressLookupTableAccount>);
-impl AddressLoader for AltCache<'_> {
-    fn load_addresses(
-        self,
-        lookups: &[MessageAddressTableLookup],
-    ) -> Result<LoadedAddresses, AddressLoaderError> {
-        lookups
-            .iter()
-            .map(|lookup| {
-                let account = self
-                    .0
-                    .get(&lookup.account_key)
-                    .ok_or(AddressLoaderError::LookupTableAccountNotFound)?;
-                let writable = lookup
-                    .writable_indexes
-                    .iter()
-                    .map(|&index| {
-                        account
-                            .addresses
-                            .get(index as usize)
-                            .copied()
-                            .ok_or(AddressLoaderError::InvalidLookupIndex)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let readonly = lookup
-                    .readonly_indexes
-                    .iter()
-                    .map(|&index| {
-                        account
-                            .addresses
-                            .get(index as usize)
-                            .copied()
-                            .ok_or(AddressLoaderError::InvalidLookupIndex)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(LoadedAddresses { writable, readonly })
-            })
-            .collect()
-    }
 }

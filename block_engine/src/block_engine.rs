@@ -10,8 +10,6 @@ use std::{
 };
 
 use cached::{Cached, TimedCache};
-use dashmap::DashMap;
-use jito_core::ofac::is_tx_ofac_related;
 use jito_protos::{
     auth::{
         auth_service_client::AuthServiceClient, GenerateAuthChallengeRequest,
@@ -33,14 +31,16 @@ use rand::Rng;
 use solana_core::banking_trace::BankingPacketBatch;
 use solana_metrics::{datapoint_error, datapoint_info};
 use solana_sdk::{
-    address_lookup_table::AddressLookupTableAccount, pubkey::Pubkey, signature::Signer,
-    signer::keypair::Keypair, transaction::VersionedTransaction,
+    pubkey::Pubkey, signature::Signer, signer::keypair::Keypair, transaction::VersionedTransaction,
 };
 use thiserror::Error;
 use tokio::{
     runtime::Runtime,
     select,
-    sync::{broadcast::Receiver, mpsc::channel as mpsc_channel, mpsc::Sender},
+    sync::{
+        broadcast::Receiver,
+        mpsc::{channel as mpsc_channel, Sender},
+    },
     time::{interval, sleep},
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -635,7 +635,7 @@ impl BlockEngineRelayerHandler {
         num_packets: u64,
         accounts_of_interest: &mut TimedCache<Pubkey, u8>,
         programs_of_interest: &mut TimedCache<Pubkey, u8>,
-        ofac_addresses: &HashSet<Pubkey>,
+        _ofac_addresses: &HashSet<Pubkey>,
     ) -> Option<ExpiringPacketBatch> {
         let mut filtered_packets = Vec::with_capacity(num_packets as usize);
 
@@ -646,13 +646,7 @@ impl BlockEngineRelayerHandler {
                 }
 
                 if let Ok(tx) = packet.deserialize_slice::<VersionedTransaction, _>(..) {
-                    let is_forwardable = if ofac_addresses.is_empty() {
-                        is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
-                    } else {
-                        is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest)
-                    };
-
-                    if is_forwardable {
+                    if is_aoi_in_static_keys(&tx, accounts_of_interest, programs_of_interest) {
                         if let Some(packet) = packet_to_proto_packet(packet) {
                             filtered_packets.push(packet)
                         }
@@ -714,42 +708,4 @@ fn is_aoi_in_static_keys(
                 // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
                 || programs_of_interest.cache_get(acc).is_some()
         })
-}
-
-/// For each lookup table, look at the writable_indexes and do a lookup in the address_lookup_table_cache
-/// to find the address. Then determine if in accounts_of_interest
-fn is_aoi_in_lookup_table(
-    tx: &VersionedTransaction,
-    accounts_of_interest: &mut TimedCache<Pubkey, u8>,
-    programs_of_interest: &mut TimedCache<Pubkey, u8>,
-    address_lookup_table_cache: &DashMap<Pubkey, AddressLookupTableAccount>,
-) -> bool {
-    if let Some(lookup_tables) = tx.message.address_table_lookups() {
-        for table in lookup_tables {
-            if let Some(lookup_info) = address_lookup_table_cache.get(&table.account_key) {
-                for idx in &table.writable_indexes {
-                    if let Some(writable_account) = lookup_info.addresses.get(*idx as usize) {
-                        if accounts_of_interest.cache_get(writable_account).is_some()
-                            // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
-                            // also txs can say programs are write-locked, but they're demoted to read-locked when loaded.
-                            || programs_of_interest.cache_get(writable_account).is_some()
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                for idx in &table.readonly_indexes {
-                    if let Some(readonly_account) = lookup_info.addresses.get(*idx as usize) {
-                        // note: can't detect CPIs without execution, so aggressively forward txs than contain account in POI
-                        // also txs can say programs are write-locked, but they're demoted to read-locked when loaded.
-                        if programs_of_interest.cache_get(readonly_account).is_some() {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
 }
