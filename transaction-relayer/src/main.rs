@@ -584,7 +584,7 @@ fn main() {
 
     let relayer_state = Arc::new(RelayerState::new(
         health_manager.handle(),
-        &is_connected_to_block_engine,
+        &is_connected_to_forge_block_engine,
         relayer_svc.handle(),
     ));
 
