@@ -1884,7 +1884,7 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
 name = "forge-block-engine"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "cached",
  "dashmap",
@@ -2584,7 +2584,7 @@ checksum = "af150ab688ff2122fcef229be89cb50dd66af9e01a4ff320cc137eecc9bacc38"
 
 [[package]]
 name = "jito-block-engine"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "cached",
  "dashmap",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "jito-core"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "crossbeam-channel",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "jito-protos"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "bytes",
@@ -2647,7 +2647,7 @@ dependencies = [
 
 [[package]]
 name = "jito-relayer"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -2678,7 +2678,7 @@ dependencies = [
 
 [[package]]
 name = "jito-relayer-web"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "axum 0.5.17",
  "jito-relayer",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "jito-rpc"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "dashmap",
@@ -7782,7 +7782,7 @@ dependencies = [
 
 [[package]]
 name = "transaction-relayer"
-version = "0.1.14"
+version = "0.2.0"
 dependencies = [
  "bincode",
  "clap 4.4.8",
