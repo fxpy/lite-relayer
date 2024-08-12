@@ -14,7 +14,7 @@ use std::{
 
 use clap::Parser;
 use env_logger::Env;
-use forge_block_engine::block_engine::{
+use x_block_engine::block_engine::{
     BlockEngineConfig as ForgeBlockEngineConfig,
     BlockEngineRelayerHandler as ForgeBlockEngineRelayerHandler,
 };
@@ -138,12 +138,12 @@ struct Args {
     /// Address for Forge Block Engine.
     /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
     #[arg(long, env)]
-    forge_block_engine_url: Option<String>,
+    x_block_engine_url: Option<String>,
 
     /// Manual override for authentication service address of the block-engine.
     /// Defaults to `--block-engine-url`
     #[arg(long, env)]
-    forge_block_engine_auth_service_url: Option<String>,
+    x_block_engine_auth_service_url: Option<String>,
 
     /// Address for Jito Block Engine.
     /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
@@ -478,12 +478,12 @@ fn main() {
         watch::channel(Default::default());
 
     // Forge Block Engine
-    let is_connected_to_forge_block_engine = Arc::new(AtomicBool::new(false));
-    let forge_block_engine_config =
-        if !args.disable_mempool && args.forge_block_engine_url.is_some() {
-            let block_engine_url = args.forge_block_engine_url.unwrap();
+    let is_connected_to_x_block_engine = Arc::new(AtomicBool::new(false));
+    let x_block_engine_config =
+        if !args.disable_mempool && args.x_block_engine_url.is_some() {
+            let block_engine_url = args.x_block_engine_url.unwrap();
             let auth_service_url = args
-                .forge_block_engine_auth_service_url
+                .x_block_engine_auth_service_url
                 .unwrap_or(block_engine_url.clone());
             Some(ForgeBlockEngineConfig {
                 block_engine_url,
@@ -492,14 +492,14 @@ fn main() {
         } else {
             None
         };
-    let forge_block_engine_forwarder = ForgeBlockEngineRelayerHandler::new(
-        forge_block_engine_config,
+    let x_block_engine_forwarder = ForgeBlockEngineRelayerHandler::new(
+        x_block_engine_config,
         block_engine_receiver,
         connected_validators_watch,
         keypair.clone(),
         exit.clone(),
         args.aoi_cache_ttl_secs,
-        &is_connected_to_forge_block_engine,
+        &is_connected_to_x_block_engine,
         ofac_addresses.clone(),
     );
 
@@ -584,7 +584,7 @@ fn main() {
 
     let relayer_state = Arc::new(RelayerState::new(
         health_manager.handle(),
-        &is_connected_to_forge_block_engine,
+        &is_connected_to_x_block_engine,
         relayer_svc.handle(),
     ));
 
@@ -634,7 +634,7 @@ fn main() {
     for t in forward_and_delay_threads {
         t.join().unwrap();
     }
-    forge_block_engine_forwarder.join();
+    x_block_engine_forwarder.join();
     jito_block_engine_forwarder.join();
 }
 

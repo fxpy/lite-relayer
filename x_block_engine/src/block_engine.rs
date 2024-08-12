@@ -273,7 +273,7 @@ impl BlockEngineRelayerHandler {
             .await
             .map_err(|e| BlockEngineError::BlockEngineFailure(e.to_string()))?;
 
-        datapoint_info!("forge_block_engine-connection_stats",
+        datapoint_info!("x_block_engine-connection_stats",
             "block_engine_url" => block_engine_url,
             "auth_service_url" => auth_service_url,
             ("connected", 1, i64)

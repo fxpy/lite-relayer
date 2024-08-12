@@ -1883,27 +1883,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 
 [[package]]
-name = "forge-block-engine"
-version = "0.2.0"
-dependencies = [
- "cached",
- "dashmap",
- "jito-block-engine",
- "jito-core",
- "jito-protos",
- "log",
- "prost-types 0.12.3",
- "solana-core",
- "solana-metrics",
- "solana-perf",
- "solana-sdk",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tonic 0.10.2",
-]
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7789,7 +7768,6 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "env_logger",
- "forge-block-engine",
  "hostname",
  "itertools 0.10.5",
  "jito-block-engine",
@@ -7817,6 +7795,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.10.2",
+ "x-block-engine",
 ]
 
 [[package]]
@@ -8359,6 +8338,27 @@ checksum = "524e57b2c537c0f9b1e69f1965311ec12182b4122e45035b1508cd24d2adadb1"
 dependencies = [
  "cfg-if 1.0.0",
  "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "x-block-engine"
+version = "0.2.0"
+dependencies = [
+ "cached",
+ "dashmap",
+ "jito-block-engine",
+ "jito-core",
+ "jito-protos",
+ "log",
+ "prost-types 0.12.3",
+ "solana-core",
+ "solana-metrics",
+ "solana-perf",
+ "solana-sdk",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.10.2",
 ]
 
 [[package]]
