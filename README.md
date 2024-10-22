@@ -1,4 +1,4 @@
-# Forge Relayer
+# Project X Sol Relayer
 Forge Relayer acts as a transaction processing unit (TPU) proxy for Solana validators.
 
 # Building
@@ -11,10 +11,7 @@ $ cargo build -r --bin transaction-relayer
 # Running 
 1.  Choose one server from this list:
 ```
-Asia Tokyo:    http://tokyo.solanaforge.xyz
-USA West:      http://la.solanaforge.xyz
-USA East:      http://miami.solanaforge.xyz
-EU Amsterdam:  http://ams.solanaforge.xyz
+TODO
 ```
 
 2. Run
