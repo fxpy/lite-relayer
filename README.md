@@ -1,5 +1,5 @@
 # Project X Sol Relayer
-Forge Relayer acts as a transaction processing unit (TPU) proxy for Solana validators.
+Relayer acts as a transaction processing unit (TPU) proxy for Solana validators.
 
 # Building
 ```shell
