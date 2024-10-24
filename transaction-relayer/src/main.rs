@@ -135,7 +135,7 @@ struct Args {
     #[arg(long, env, default_value_t = 200)]
     packet_delay_ms: u32,
 
-    /// Address for Forge Block Engine.
+    /// Address for X Project Block Engine.
     /// See https://jito-labs.gitbook.io/mev/searcher-resources/block-engine#connection-details
     #[arg(long, env)]
     x_block_engine_url: Option<String>,
@@ -493,7 +493,7 @@ fn main() {
     let (connected_validators_sender, connected_validators_watch) =
         watch::channel(Default::default());
 
-    // Forge Block Engine
+    // X Project Block Engine
     let is_connected_to_x_block_engine = Arc::new(AtomicBool::new(false));
     let x_block_engine_config =
         if !args.disable_mempool && args.x_block_engine_url.is_some() {
