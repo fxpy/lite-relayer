@@ -30,12 +30,12 @@ COPY . .
 RUN --mount=type=cache,mode=0777,target=/home/root/app/target \
     --mount=type=cache,mode=0777,target=/usr/local/cargo/registry \
     --mount=type=cache,mode=0777,target=/usr/local/cargo/git \
-    RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release && cp target/release/jito-* ./
+    RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release && cp target/release/transaction-relayer ./
 
 FROM debian:bullseye-slim as jito-transaction-relayer
 RUN apt-get -qq update && apt-get -qq -y install ca-certificates libssl1.1 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY --from=builder /home/root/app/jito-transaction-relayer ./
+COPY --from=builder /home/root/app/transaction-relayer ./
 # COPY --from=builder /home/root/app/jito-packet-blaster ./
-ENTRYPOINT ./jito-transaction-relayer
+ENTRYPOINT ./transaction-relayer
